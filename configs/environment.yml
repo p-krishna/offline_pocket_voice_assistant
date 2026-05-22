@@ -1,0 +1,13 @@
+name: wakeword311
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy<2
+  - portaudio
+  - pip:
+      - openwakeword>=0.6,<0.7
+      - speexdsp-ns>=0.1.2
+      - pyaudio

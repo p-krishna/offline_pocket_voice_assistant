@@ -1,0 +1,35 @@
+{
+  "component": "wakeword",
+  "status": "working-desktop-prototype",
+  "platform": {
+    "os": "Ubuntu 22.04.5 LTS 64-bit",
+    "arch": "x86_64"
+  },
+  "python": {
+    "version": "3.11",
+    "notes": [
+      "Python 3.14 failed because tflite-runtime wheel was unavailable.",
+      "Use a separate Python 3.11 environment for wake-word development."
+    ]
+  },
+  "packages": {
+    "numpy": "<2",
+    "openwakeword": ">=0.6,<0.7",
+    "speexdsp-ns": ">=0.1.2",
+    "pyaudio": "latest-compatible",
+  },
+  "system_dependencies": [
+    "libspeexdsp-dev",
+    "swig",
+    "portaudio19-dev"
+  ],
+  "install_notes": [
+    "Install speexdsp-ns from PyPI, not from old hardcoded GitHub wheel URLs.",
+    "Noise suppression is optional; wake-word testing can proceed without it.",
+    "tflite-runtime compatibility is tied to supported Python versions."
+  ],
+  "project_context": {
+    "desktop_llm_for_testing": "gemma-4-E2B-it-UD-IQ2_M.gguf",
+    "goal": "offline pocket voice assistant for visually impaired users"
+  }
+}
