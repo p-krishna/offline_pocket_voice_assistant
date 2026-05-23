@@ -35,6 +35,10 @@ class ListenerConfig:
     debug_save_wav: bool = os.getenv('DEBUG_SAVE_WAV', '1') == '1'
     debug_dir: str = os.getenv('DEBUG_DIR', 'debug_audio')
 
+    whisper_bin: str = os.getenv('WHISPER_BIN', '/home/puli/projects/whisper/whisper.cpp/build/bin/whisper-cli')
+    whisper_model: str = os.getenv('WHISPER_MODEL', '/home/puli/projects/whisper/whisper.cpp/models/ggml-tiny.en.bin')
+    whisper_language: str = os.getenv('WHISPER_LANGUAGE', 'en')
+
 
 def load_config() -> ListenerConfig:
     raw_models = os.getenv('WAKEWORD_MODEL_PATHS', '').strip()

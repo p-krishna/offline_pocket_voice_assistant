@@ -3,12 +3,56 @@ import time
 from collections import deque
 from pathlib import Path
 from wave import open as wave_open
+import subprocess
+import tempfile
 
 from common import stamp
 from common.config import load_config
 from vad.webrtc import WebRTCGate
 from wakeword.listen import WakeWordListener
 from vad.silero import SileroGate
+
+
+class WhisperCppSTT:
+    def __init__(self, cfg):
+        self.bin = cfg.whisper_bin
+        self.model = cfg.whisper_model
+        self.language = cfg.whisper_language
+
+    def transcribe(self, samples, sample_rate):
+        if not samples:
+            return ""
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            with wave_open(str(tmp_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(np.concatenate(samples).astype(np.int16).tobytes())
+            cmd = [self.bin, "--no-prints", "--no-timestamps", "-m", self.model, "-f", str(tmp_path)]
+            if self.language:
+                cmd += ["-l", self.language]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            output = (result.stdout or "") + "\n" + (result.stderr or "")
+            lines = []
+            for line in output.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                if s.startswith(("system_info", "main :", "whisper_model_load", "whisper_print_timings", "load", "ggml_", "[")):
+                    continue
+                if s.startswith("***"):
+                    continue
+                if s.startswith("error:"):
+                    continue
+                lines.append(s)
+            return " \ ".join(lines).strip()
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 class Pipeline:
@@ -24,6 +68,9 @@ class Pipeline:
 
         # Silero takes over after wake word and decides when the command is over.
         self.silero = SileroGate()
+
+        # Whisper.cpp handles raw transcript generation after utterance finalization.
+        self.stt = WhisperCppSTT(self.cfg)
 
         # Main state flags for one utterance.
         self.after_wake = False
@@ -165,7 +212,10 @@ class Pipeline:
                     # Finalize only when the command is long enough and silence has stayed stable.
                     if enough_time and enough_silence:
                         print(f'[{stamp()}] Utterance ended')
-                        self.save_debug_wav(self.recording + list(self.post_roll_queue))
+                        samples = self.recording + list(self.post_roll_queue)
+                        self.save_debug_wav(samples)
+                        transcript = self.stt.transcribe(samples, self.cfg.sample_rate)
+                        print(f'[{stamp()}] Transcript: {transcript}')
                         self.reset_command_state()
                         break
 
