@@ -1,91 +1,61 @@
-import argparse
-import collections
 import signal
-import time
 
 import numpy as np
 import pyaudio
 import torch
 from silero_vad import load_silero_vad
 
+from common import now
+from common.config import load_config
+
 torch.set_num_threads(1)
+cfg = load_config()
 
-def pcm16_to_float32(audio_bytes):
-    audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-    return audio / 32768.0
 
-def main():
-    parser = argparse.ArgumentParser(description="Live microphone gate using Silero VAD + PyAudio")
-    parser.add_argument("--sample-rate", type=int, default=16000, choices=[8000, 16000])
-    parser.add_argument("--frame-ms", type=int, default=32)
-    parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--mic-index", type=int, default=None)
-    args = parser.parse_args()
+class SileroGate:
+    def __init__(self):
+        self.sample_rate = cfg.sample_rate
+        self.chunk_size = cfg.silero_chunk_size
+        self.threshold = cfg.silero_threshold
+        self.mic_index = cfg.microphone_index
+        self.model = load_silero_vad()
+        self.history = []
+        self.history_max = cfg.silero_history
+        self.state = None
+        self.started_at = None
+        self.running = True
 
-    model = load_silero_vad()
-    running = True
+    def stop(self, *_):
+        self.running = False
 
-    frames_per_buffer = int(args.sample_rate * args.frame_ms / 1000)
+    def open(self):
+        audio = pyaudio.PyAudio()
+        kwargs = dict(format=pyaudio.paInt16, channels=1, rate=self.sample_rate, input=True, frames_per_buffer=self.chunk_size)
+        if self.mic_index is not None:
+            kwargs['input_device_index'] = self.mic_index
+        return audio, audio.open(**kwargs)
 
-    history = collections.deque(maxlen=5)
+    def predict(self, pcm):
+        x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        x = torch.from_numpy(x)
+        return self.model(x, self.sample_rate).item()
 
-    def handle_signal(signum, frame):
-        nonlocal running
-        running = False
-
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-
-    audio = pyaudio.PyAudio()
-    stream = audio.open(
-        format=pyaudio.paInt16,
-        channels=1,
-        rate=args.sample_rate,
-        input=True,
-        input_device_index=args.mic_index,
-        frames_per_buffer=frames_per_buffer,
-    )
-
-    last_state = None
-    last_state_start = None
-
-    print("Starting Silero VAD mic gate... Ctrl+C to stop")
-
-    try:
-        while running:
-            frame = stream.read(frames_per_buffer, exception_on_overflow=False)
-            x = pcm16_to_float32(frame)
-            x = torch.from_numpy(x)
-
-            prob = model(x, args.sample_rate).item()
-            history.append(prob)
-            avg_prob = sum(history) / len(history)
-
-            state = "speech" if avg_prob >= args.threshold else "silence"
-            now = time.monotonic()
-
-            if last_state is None:
-                last_state = state
-                last_state_start = now
-                print(f"{time.strftime('%H:%M:%S')} -> {state} prob={avg_prob:.3f}")
-                continue
-
-            if state != last_state:
-                duration = now - last_state_start
-                print(f"{time.strftime('%H:%M:%S')} -> {last_state} ended after {duration:.2f}s")
-                print(f"{time.strftime('%H:%M:%S')} -> {state} prob={avg_prob:.3f}")
-                last_state = state
-                last_state_start = now
-
-    finally:
-        if last_state is not None and last_state_start is not None:
-            duration = time.monotonic() - last_state_start
-            print(f"{time.strftime('%H:%M:%S')} -> {last_state} ended after {duration:.2f}s")
-
-        stream.stop_stream()
-        stream.close()
-        audio.terminate()
-        print("Stopped.")
-
-if __name__ == "__main__":
-    main()
+    def update(self, prob):
+        self.history.append(prob)
+        if len(self.history) > self.history_max:
+            self.history.pop(0)
+        avg = sum(self.history) / len(self.history)
+        new_state = 'speech' if avg >= self.threshold else 'silence'
+        t = now()
+        old = self.state
+        changed = new_state != self.state
+        if self.state is None:
+            self.state = new_state
+            self.started_at = t
+            return True, new_state, None, avg, self.started_at, t
+        if changed:
+            started = self.started_at
+            self.state = new_state
+            self.started_at = t
+            return True, new_state, old, avg, started, t
+        return False, new_state, old, avg, self.started_at, t

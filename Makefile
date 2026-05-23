@@ -9,7 +9,7 @@ install-system:
 
 install:
 	$(PIP) install -U pip setuptools wheel
-	$(PIP) install -r configs/wakeword/requirements.txt
+	$(PIP) install -r configs/requirements.txt
 
 run:
 	PYTHONPATH=src/wakeword $(PYTHON) src/wakeword/listen.py
@@ -21,8 +21,11 @@ run-ns:
 	WAKEWORD_ENABLE_SPEEX_NS=1 PYTHONPATH=src/wakeword $(PYTHON) src/wakeword/listen.py
 
 list-devices:
-	PYTHONPATH=src/wakeword $(PYTHON) src/wakeword/listen.py --list-devices
+	PYTHONPATH=src $(PYTHON) src/wakeword/listen.py --list-devices
 
 check:
 	$(PYTHON) --version
 	$(PYTHON) -c "import openwakeword, numpy; print('imports ok')"
+
+run-pipeline:
+	PYTHONPATH=src python src/pipeline/assistant_pipeline.py
