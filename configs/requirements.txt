@@ -9,3 +9,5 @@ numpy<2
 openwakeword>=0.6,<0.7
 speexdsp-ns>=0.1.2
 pyaudio
+silero-vad
+webrtcvad
