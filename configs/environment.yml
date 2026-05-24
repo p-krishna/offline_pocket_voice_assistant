@@ -13,3 +13,4 @@ dependencies:
       - pyaudio
       - silero-vad
       - webrtcvad
+      - kokoro-onnx

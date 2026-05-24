@@ -11,3 +11,4 @@ speexdsp-ns>=0.1.2
 pyaudio
 silero-vad
 webrtcvad
+kokoro-onnx

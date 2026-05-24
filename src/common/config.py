@@ -4,7 +4,7 @@ import os
 
 
 @dataclass
-class ListenerConfig:
+class Config:
     wakeword: str = os.getenv('WAKEWORD', 'hey_jarvis')
     sample_rate: int = int(os.getenv('WAKEWORD_SAMPLE_RATE', '16000'))
     wakeword_chunk_size: int = int(os.getenv('WAKEWORD_CHUNK_SIZE', '480'))
@@ -39,8 +39,25 @@ class ListenerConfig:
     whisper_model: str = os.getenv('WHISPER_MODEL', '/home/puli/projects/whisper/whisper.cpp/models/ggml-tiny.en.bin')
     whisper_language: str = os.getenv('WHISPER_LANGUAGE', 'en')
 
+    llm_server_url: str = os.getenv('LLM_SERVER_URL', 'http://127.0.0.1:8080')
+    llm_system_prompt: str = os.getenv(
+        'LLM_SYSTEM_PROMPT',
+        'You are a helpful offline voice assistant for a visually impaired user. '
+        'Answer clearly, briefly, and in plain spoken English. '
+        'Do not use markdown or bullets unless necessary. '
+        'Keep the response focused on the user\'s question.'
+        'Be polite, concise and positive'
+    )
+    llm_predict_tokens: int = int(os.getenv('LLM_PREDICT_TOKENS', '150'))
 
-def load_config() -> ListenerConfig:
+    kokoro_model_path: str = os.getenv('KOKORO_MODEL_PATH', '/home/puli/projects/kokoro/kokoro-v1.0.onnx')
+    kokoro_voices_path: str = os.getenv('KOKORO_VOICES_PATH', '/home/puli/projects/kokoro/voices.json')
+    tts_voice: str = os.getenv('TTS_VOICE', 'af')
+    tts_output_dir: str = os.getenv('TTS_OUTPUT_DIR', 'debug_audio')
+    tts_playback_rate: int = int(os.getenv('TTS_PLAYBACK_RATE', '8000'))
+
+
+def load_config() -> Config:
     raw_models = os.getenv('WAKEWORD_MODEL_PATHS', '').strip()
     model_paths = [m.strip() for m in raw_models.split(',') if m.strip()]
-    return ListenerConfig(model_paths=model_paths)
+    return Config(model_paths=model_paths)
