@@ -16,44 +16,40 @@ from tts.kokoro import KokoroTTS
 
 class Pipeline:
     def __init__(self):
-        # Load one shared config so every stage uses the same timing rules.
+        # Load one shared config so every stage uses the same settings.
         self.cfg = load_config()
 
-        # WebRTC is used only before wake word to avoid pointless wake checks.
+        # WebRTC gates silence before wake word detection.
         self.webrtc = WebRTCGate()
 
-        # Wake word model runs only when WebRTC says there is speech.
+        # Wake word runs only when WebRTC says there is speech.
         self.wake = WakeWordListener()
 
-        # Silero takes over after wake word and decides when the command is over.
+        # Silero decides when the command utterance has ended.
         self.silero = SileroGate()
 
-        # Whisper.cpp handles raw transcript generation after utterance finalization.
+        # STT, LLM and TTS are now all server-based — no model loading here.
         self.stt = WhisperCppSTT(self.cfg)
-
-        # Llama.cpp handles response generation from the raw transcript.
         self.llm = GemmaLLM(self.cfg)
-
-        # Kokoro TTS converts the LLM response to speech and plays it back.
         self.tts = KokoroTTS(self.cfg)
 
-        # Main state flags for one utterance.
-        self.after_wake        = False
-        self.silence_frames    = 0
+        # State flags for one utterance cycle.
+        self.after_wake         = False
+        self.silence_frames     = 0
         self.command_start_time = None
 
-        # Buffers for the current command.
+        # Audio buffers for current command.
         self.silero_buf = np.zeros(0, dtype=np.int16)
         self.recording  = []
 
-        # Keep a little audio before wake word so the command start is not clipped.
+        # Pre-roll avoids clipping the start of the command.
         pre_roll_frames = max(1, int(
             (self.cfg.utterance_pre_roll_ms / 1000) * self.cfg.sample_rate / self.webrtc.frame_samples
         ))
         self.pre_roll = deque(maxlen=pre_roll_frames)
 
     def save_debug_wav(self, samples):
-        # Save the command only when debug saving is turned on.
+        # Save the command audio when debug saving is enabled.
         if not self.cfg.debug_save_wav or not samples:
             return
         out_dir = Path(self.cfg.debug_dir)
@@ -67,7 +63,7 @@ class Pipeline:
         print(f"[{stamp()}] Debug WAV saved: {path}")
 
     def reset_command_state(self):
-        # Reset only the post-wake command state so the pipeline can accept the next command.
+        # Reset post-wake state so the pipeline is ready for the next command.
         self.after_wake         = False
         self.silence_frames     = 0
         self.command_start_time = None
@@ -79,33 +75,30 @@ class Pipeline:
         self.pre_roll.clear()
 
     def run(self):
-        # Post-roll queue keeps a tiny tail after speech ends.
+        # Post-roll captures a small tail after speech ends to avoid clipping.
         post_roll_frames = max(1, int(
             (self.cfg.utterance_post_roll_ms / 1000) * self.cfg.sample_rate / self.webrtc.frame_samples
         ))
         self.post_roll_queue = deque(maxlen=post_roll_frames)
 
-        print("Pipeline: WebRTC -> openWakeWord -> Silero -> Whisper -> Gemma -> Kokoro")
-        print(f"wakeword={self.cfg.wakeword} sample_rate={self.cfg.sample_rate}")
-        print(f"debug_mode={self.cfg.debug_mode} debug_save_wav={self.cfg.debug_save_wav}")
+        print("Pipeline: WebRTC -> openWakeWord -> Silero -> Whisper[8081] -> Gemma[8080] -> Kokoro[8082]")
+        print(f"wakeword={self.cfg.wakeword}  sample_rate={self.cfg.sample_rate}")
+        print(f"debug_mode={self.cfg.debug_mode}  debug_save_wav={self.cfg.debug_save_wav}")
         print("Press Ctrl+C to stop.")
 
         audio, stream = self.webrtc.open()
         try:
             while self.webrtc.running:
-                # Read one fixed microphone frame.
                 pcm   = stream.read(self.webrtc.frame_samples, exception_on_overflow=False)
                 t     = time.monotonic()
                 frame = np.frombuffer(pcm, dtype=np.int16)
 
-                # Keep a small pre-roll history for the next possible wake word.
                 self.pre_roll.append(frame)
 
-                # Before wake word, let WebRTC cheaply reject silence.
+                # --- Pre-wake: WebRTC gates silence cheaply ---
                 if not self.after_wake:
                     new_webrtc_state = "speech" if self.webrtc.vad.is_speech(pcm, self.webrtc.sample_rate) else "silence"
 
-                    # Log only when WebRTC changes state.
                     if self.webrtc.state is None:
                         self.webrtc.state      = new_webrtc_state
                         self.webrtc.started_at = t
@@ -116,18 +109,16 @@ class Pipeline:
                         self.webrtc.state      = new_webrtc_state
                         self.webrtc.started_at = t
 
-                    # Ignore silence before wake word.
                     if self.webrtc.state != "speech":
                         continue
 
-                    # Run wake word only on speech frames.
+                    # --- Wake word detection ---
                     score = self.wake.model.predict(frame).get(self.cfg.wakeword, 0.0)
                     if score >= self.wake.threshold:
                         self.wake.hits += 1
                     else:
                         self.wake.hits = 0
 
-                    # Once the hit count reaches the trigger, start command capture.
                     if self.wake.hits >= self.wake.trigger_level:
                         self.wake.hits           = 0
                         self.after_wake          = True
@@ -142,51 +133,44 @@ class Pipeline:
                         print(f"[{stamp()}] WakeWord detected: {self.cfg.wakeword} score={score:.3f}")
                     continue
 
-                # After wake word, only Silero decides speech start/end.
+                # --- Post-wake: Silero decides end of utterance ---
                 self.recording.append(frame)
                 self.post_roll_queue.append(frame)
                 self.silero_buf = np.concatenate([self.silero_buf, frame])
 
-                # Process Silero in fixed-size chunks.
                 while len(self.silero_buf) >= self.silero.chunk_size:
                     chunk           = self.silero_buf[:self.silero.chunk_size]
                     self.silero_buf = self.silero_buf[self.silero.chunk_size:]
                     prob            = self.silero.predict(chunk.tobytes())
                     changed, new_state, old_state, avg, started, t2 = self.silero.update(prob)
 
-                    # Log only real state changes.
                     if changed:
                         if old_state is None:
                             print(f"[{stamp()}] Silero {new_state} (start) avg={avg:.3f}")
                         else:
                             print(f"[{stamp()}] Silero {old_state} -> {new_state} after {t2 - started:.2f}s avg={avg:.3f}")
 
-                    # Count silence only after Silero has actually decided silence.
                     if self.silero.state == "silence":
                         self.silence_frames += 1
                     else:
                         self.silence_frames = 0
 
-                    # Make sure the utterance is long enough before finalizing.
                     command_age_ms = (t - self.command_start_time) * 1000 if self.command_start_time else 0
                     enough_silence = self.silence_frames >= self.cfg.silero_stop_silence_frames
                     enough_time    = command_age_ms >= self.cfg.utterance_min_ms
 
-                    # Finalize only when the command is long enough and silence has stayed stable.
                     if enough_time and enough_silence:
                         print(f"[{stamp()}] Utterance ended")
                         samples = self.recording + list(self.post_roll_queue)
                         self.save_debug_wav(samples)
 
-                        # STT: audio -> raw transcript
+                        # STT -> LLM -> TTS  (all HTTP, no subprocess)
                         transcript = self.stt.transcribe(samples, self.cfg.sample_rate)
                         print(f"[{stamp()}] Transcript: {transcript}")
 
-                        # LLM: transcript -> plain text response
                         response = self.llm.generate(transcript)
                         print(f"[{stamp()}] LLM: {response}")
 
-                        # TTS: response -> synthesize -> save WAV -> play
                         self.tts.speak(response)
 
                         self.reset_command_state()
