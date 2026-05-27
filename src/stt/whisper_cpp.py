@@ -49,6 +49,7 @@ class WhisperCppSTT:
                 f"{self.url}/inference",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary.decode()}"},
+                timeout=cfg.http_timeout
             )
 
             with urllib.request.urlopen(req, timeout=30) as resp:

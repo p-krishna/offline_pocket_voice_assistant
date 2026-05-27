@@ -77,6 +77,16 @@ class Config:
     tts_voice:                         str   = os.getenv('TTS_VOICE',      'af')
     tts_output_dir:                    str   = os.getenv('TTS_OUTPUT_DIR', 'debug_audio')
 
+    # Seconds to wait for any server HTTP response before giving up.
+    # Prevents the pipeline from hanging forever when a server is down.
+    http_timeout: int = int(os.environ.get("HTTP_TIMEOUT", "10"))
+
+    # What the assistant says out loud when any stage (STT/LLM/TTS) fails.
+    # Kept short so Kokoro synthesis is fast even under degraded conditions.
+    fallback_phrase: str = os.environ.get(
+        "FALLBACK_PHRASE", "Sorry, something went wrong. Please try again."
+    )
+
 
 def load_config() -> Config:
     raw_models  = os.getenv('WAKEWORD_MODEL_PATHS', '').strip()

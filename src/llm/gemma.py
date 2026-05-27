@@ -28,6 +28,7 @@ class GemmaLLM:
             f"{self.url}/v1/chat/completions",
             data=payload,
             headers={"Content-Type": "application/json"},
+            timeout=cfg.http_timeout
         )
 
         try:
