@@ -13,6 +13,7 @@ class WhisperCppSTT:
     def __init__(self, cfg):
         self.url      = cfg.stt_server_url   # http://127.0.0.1:8081
         self.language = cfg.whisper_language
+        self.timeout  = cfg.http_timeout
 
     def transcribe(self, samples, sample_rate):
         if not samples:
@@ -49,7 +50,6 @@ class WhisperCppSTT:
                 f"{self.url}/inference",
                 data=body,
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary.decode()}"},
-                timeout=cfg.http_timeout
             )
 
             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -60,7 +60,7 @@ class WhisperCppSTT:
 
         except Exception as e:
             print(f"[STT] Request failed: {e}")
-            return ""
+            raise
 
         finally:
             try:

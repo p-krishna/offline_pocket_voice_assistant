@@ -165,16 +165,34 @@ class Pipeline:
                         self.save_debug_wav(samples)
 
                         # STT -> LLM -> TTS  (all HTTP, no subprocess)
-                        transcript = self.stt.transcribe(samples, self.cfg.sample_rate)
-                        print(f"[{stamp()}] Transcript: {transcript}")
+                        # Each stage gets its own except so we can give a specific spoken message.
+                        # The outer finally always resets state — the pipeline never gets stuck.
+                        try:
+                            transcript = self.stt.transcribe(samples, self.cfg.sample_rate)
+                            print(f"[{stamp()}] Transcript: {transcript}")
 
-                        response = self.llm.generate(transcript)
-                        print(f"[{stamp()}] LLM: {response}")
+                            if not transcript or not transcript.strip():
+                                # Whisper returned empty — audio too short or inaudible.
+                                print(f"[{stamp()}] STT returned empty transcript, speaking fallback.")
+                                self.tts.speak("Sorry, I did not catch that. Please try again.")
+                            else:
+                                response = self.llm.generate(transcript)
+                                print(f"[{stamp()}] LLM: {response}")
+                                self.tts.speak(response)
 
-                        self.tts.speak(response)
-
-                        self.reset_command_state()
-                        break
+                        except Exception as e:
+                            # One of the servers failed. Speak the configured fallback phrase
+                            # so the user always hears something, never silence.
+                            print(f"[{stamp()}] Pipeline error: {e}")
+                            try:
+                                self.tts.speak(self.cfg.fallback_phrase)
+                            except Exception as tts_err:
+                                # TTS itself is down — kokoro.py will have already played a beep.
+                                print(f"[{stamp()}] Fallback TTS also failed: {tts_err}")
+                        finally:
+                            # Always reset so the pipeline returns to listening.
+                            self.reset_command_state()
+                            break
 
         except KeyboardInterrupt:
             print("\nStopping pipeline...")
