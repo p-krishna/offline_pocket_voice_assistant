@@ -1,0 +1,14 @@
+# Wake-word stack for Ubuntu 22.04 desktop prototype
+# Known-good direction from current testing:
+# - Python 3.11
+# - numpy < 2
+# - openwakeword 0.6.x
+# - speexdsp-ns from PyPI
+
+numpy<2
+openwakeword>=0.6,<0.7
+speexdsp-ns>=0.1.2
+pyaudio
+silero-vad
+webrtcvad
+kokoro-onnx
