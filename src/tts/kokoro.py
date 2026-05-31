@@ -20,7 +20,7 @@ class KokoroTTS:
         self.timeout = cfg.http_timeout
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ADD this helper method — avoids duplicating the PyAudio logic in beep fallback:
+    # this helper method — avoids duplicating the PyAudio logic in beep fallback:
     def _play_wav_bytes(self, wav_bytes: bytes) -> None:
         """Play raw WAV bytes via PyAudio. Shared by speak() and the beep fallback."""
         buf = io.BytesIO(wav_bytes)
@@ -33,7 +33,7 @@ class KokoroTTS:
         stream.close()
         pa.terminate()
 
-    # ADD this method — stdlib only, no server needed:
+    # this method — stdlib only, no server needed:
     def _play_beep(self) -> None:
         """
         Play a short 440 Hz beep directly via PyAudio.
@@ -72,7 +72,7 @@ class KokoroTTS:
                 wav_bytes = resp.read()
         except Exception as e:
             print(f"[TTS] Request failed: {e}")
-            # ADD: play a beep so the user knows something went wrong.
+            # play a beep so the user knows something went wrong.
             # Silence is never acceptable for a visually impaired user.
             try:
                 self._play_beep()

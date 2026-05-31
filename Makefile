@@ -2,7 +2,9 @@ PYTHON ?= python
 PIP    ?= pip
 
 .PHONY: install install-system install-python-deps serve-llm serve-stt serve-tts \
-        list-devices check-wakeword check-tts check-llm check-stt run-pipeline
+        serve-all watch-servers \
+        list-devices check-wakeword check-tts check-llm check-stt run-pipeline \
+		kill-servers
 
 # ── System dependencies ───────────────────────────────────────────────────────
 install-system:
@@ -48,22 +50,45 @@ run-pipeline:
 	@nc -z 127.0.0.1 8080 || ( \
 		echo "LLM server not running — starting..."; \
 		/bin/bash src/llm/serve_gemma.sh & \
-		sleep 5 \
 	)
 
 	@# STT server on 8081
 	@nc -z 127.0.0.1 8081 || ( \
 		echo "STT server not running — starting..."; \
 		/bin/bash src/stt/serve_whisper.sh & \
-		sleep 3 \
 	)
 
 	@# TTS server on 8082
 	@nc -z 127.0.0.1 8082 || ( \
 		echo "TTS server not running — starting..."; \
 		PYTHONPATH=src $(PYTHON) src/tts/serve_kokoro.py & \
-		sleep 5 \
 	)
 
-	@echo "All servers running. Starting pipeline..."
+	@# The pipeline itself calls wait_for_servers() and will block
+	@# until all three servers respond — no fixed sleep needed.
+	@echo "Servers launched. Pipeline will wait until all are ready..."
 	PYTHONPATH=src $(PYTHON) src/pipeline/assistant_pipeline.py
+
+
+# start all three servers in the background (no pipeline)
+serve-all:
+	@echo "Starting all servers in background..."
+	/bin/bash src/llm/serve_gemma.sh &
+	/bin/bash src/stt/serve_whisper.sh &
+	PYTHONPATH=src $(PYTHON) src/tts/serve_kokoro.py &
+	@echo "Done. Use 'make watch-servers' to monitor them."
+
+
+# run the watchdog — restarts any server that goes down
+watch-servers:
+	PYTHONPATH=src $(PYTHON) src/common/servers.py
+
+check-servers:
+	nc -z 127.0.0.1 8080 && echo "LLM up" || echo "LLM down" && nc -z 127.0.0.1 8081 && echo "STT up" || echo "STT down" && nc -z 127.0.0.1 8082 && echo "TTS up" || echo "TTS down"
+
+kill-servers:
+	@echo "Killing all servers..."
+	-@pkill -f llama-server   && echo "LLM server killed."  || echo "LLM server not running."
+	-@pkill -f whisper-server && echo "STT server killed."  || echo "STT server not running."
+	-@pkill -f serve_kokoro   && echo "TTS server killed."  || echo "TTS server not running."
+	@echo "Done."

@@ -6,6 +6,7 @@ from wave import open as wave_open
 
 from common import stamp
 from common.config import load_config
+from common.servers import wait_for_servers, SERVERS, _ping, _start
 from vad.webrtc import WebRTCGate
 from wakeword.listen import WakeWordListener
 from vad.silero import SileroGate
@@ -84,6 +85,12 @@ class Pipeline:
         print("Pipeline: WebRTC -> openWakeWord -> Silero -> Whisper[8081] -> Gemma[8080] -> Kokoro[8082]")
         print(f"wakeword={self.cfg.wakeword}  sample_rate={self.cfg.sample_rate}")
         print(f"debug_mode={self.cfg.debug_mode}  debug_save_wav={self.cfg.debug_save_wav}")
+        
+        # Health check: block until all three servers respond.
+        # Raises RuntimeError if any server never comes up — prevents the pipeline
+        # from starting before models are loaded.
+        wait_for_servers()
+        
         print("Press Ctrl+C to stop.")
 
         audio, stream = self.webrtc.open()
@@ -184,6 +191,17 @@ class Pipeline:
                             # One of the servers failed. Speak the configured fallback phrase
                             # so the user always hears something, never silence.
                             print(f"[{stamp()}] Pipeline error: {e}")
+
+                            # attempt to restart whichever server caused the failure.
+                            # _ping() is cheap — check all three and restart any that are down.
+                            for srv in SERVERS:
+                                if not _ping(srv["url"]):
+                                    print(f"[{stamp()}] {srv['name']} appears down — attempting restart...")
+                                    _start(srv)
+                                    # Give it a moment before the next utterance tries again.
+                                    time.sleep(3)
+
+                            # Speak fallback so the user hears something.
                             try:
                                 self.tts.speak(self.cfg.fallback_phrase)
                             except Exception as tts_err:
