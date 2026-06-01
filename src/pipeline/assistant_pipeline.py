@@ -38,6 +38,11 @@ class Pipeline:
         self.after_wake         = False
         self.silence_frames     = 0
         self.command_start_time = None
+        # Rolling conversation history — list of {"role": ..., "content": ...} dicts.
+        # Stores up to cfg.memory_turns past turns (user + assistant pairs).
+        # User messages stored in full; assistant responses truncated to save tokens.
+        # maxlen * 2 because each turn = 2 messages (user + assistant).
+        self.history: deque = deque(maxlen=self.cfg.memory_turns * 2)
 
         # Audio buffers for current command.
         self.silero_buf = np.zeros(0, dtype=np.int16)
@@ -65,6 +70,8 @@ class Pipeline:
 
     def reset_command_state(self):
         # Reset post-wake state so the pipeline is ready for the next command.
+        # NOTE: self.history is intentionally NOT reset here — it persists
+        # across turns for the duration of the session.
         self.after_wake         = False
         self.silence_frames     = 0
         self.command_start_time = None
@@ -85,7 +92,8 @@ class Pipeline:
         print("Pipeline: WebRTC -> openWakeWord -> Silero -> Whisper[8081] -> Gemma[8080] -> Kokoro[8082]")
         print(f"wakeword={self.cfg.wakeword}  sample_rate={self.cfg.sample_rate}")
         print(f"debug_mode={self.cfg.debug_mode}  debug_save_wav={self.cfg.debug_save_wav}")
-        
+        print(f"memory_turns={self.cfg.memory_turns}  utterance_floor_ms={self.cfg.utterance_floor_ms}")
+
         # Health check: block until all three servers respond.
         # Raises RuntimeError if any server never comes up — prevents the pipeline
         # from starting before models are loaded.
@@ -166,8 +174,19 @@ class Pipeline:
                     enough_silence = self.silence_frames >= self.cfg.silero_stop_silence_frames
                     enough_time    = command_age_ms >= self.cfg.utterance_min_ms
 
-                    if enough_time and enough_silence:
-                        print(f"[{stamp()}] Utterance ended")
+                    # Early exit: if Silero is very confident it's silence (avg below
+                    # threshold) AND past the floor — finalize without waiting utterance_min_ms.
+                    # Makes short commands like "stop" or "yes" feel instant.
+                    past_floor = command_age_ms >= self.cfg.utterance_floor_ms
+                    very_silent = avg < self.cfg.silero_early_exit_threshold
+                    early_exit = past_floor and very_silent and enough_silence
+
+                    if (enough_time and enough_silence) or early_exit:
+                        if early_exit and not enough_time:
+                            print(f"[{stamp()}] Early exit at {command_age_ms:.0f}ms (avg={avg:.3f})")
+                        else:
+                            print(f"[{stamp()}] Utterance ended")
+
                         samples = self.recording + list(self.post_roll_queue)
                         self.save_debug_wav(samples)
 
@@ -183,9 +202,27 @@ class Pipeline:
                                 print(f"[{stamp()}] STT returned empty transcript, speaking fallback.")
                                 self.tts.speak("Sorry, I did not catch that. Please try again.")
                             else:
-                                response = self.llm.generate(transcript)
+                                # Save user message immediately — even if LLM fails,
+                                # the next turn knows what was asked.
+                                self.history.append({"role": "user", "content": transcript})
+
+                                # --- LLM (with conversation history) ---
+                                # Pass history excluding the current user message we just
+                                # appended — generate() appends it as the final user turn.
+                                response = self.llm.generate(
+                                    transcript,
+                                    history=list(self.history)[:-1]
+                                )
                                 print(f"[{stamp()}] LLM: {response}")
-                                self.tts.speak(response)
+
+                                # Save assistant response truncated to protect token budget.
+                                # Full response is still spoken — only stored copy is shorter.
+                                stored = response[:self.cfg.memory_assistant_max_chars]
+                                self.history.append({"role": "assistant", "content": stored})
+
+                                # --- TTS (sentence-by-sentence streaming) ---
+                                # Starts playing the first sentence before the rest is processed.
+                                self.tts.speak_streaming(response)
 
                         except Exception as e:
                             # One of the servers failed. Speak the configured fallback phrase

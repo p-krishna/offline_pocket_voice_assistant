@@ -86,6 +86,25 @@ class Config:
     fallback_phrase: str = os.environ.get(
         "FALLBACK_PHRASE", "Sorry, something went wrong. Please try again."
     )
+    # --- Conversation memory ---
+    # Number of past turns (user+assistant pairs) to keep in rolling history.
+    # Each turn = 2 messages. 3 turns = 6 extra messages in the LLM payload.
+    memory_turns: int = int(os.environ.get("MEMORY_TURNS", "3"))
+
+    # Max characters to store for each assistant response in history.
+    # The full response is always spoken — only the stored copy is truncated.
+    # Keeps token load low on 2nd and 3rd exchanges.
+    memory_assistant_max_chars: int = int(os.environ.get("MEMORY_ASSISTANT_MAX_CHARS", "120"))
+
+    # --- Smarter utterance detection ---
+    # Minimum ms before ANY finalization, even with very confident silence.
+    # Prevents mouth sounds / single words being cut off too early.
+    # utterance_min_ms is still the normal gate; this is only the early-exit floor.
+    utterance_floor_ms: int = int(os.environ.get("UTTERANCE_FLOOR_MS", "300"))
+
+    # Silero avg probability below this = very confident silence → allow early exit.
+    # Only applies after utterance_floor_ms has passed.
+    silero_early_exit_threshold: float = float(os.environ.get("SILERO_EARLY_EXIT_THRESHOLD", "0.15"))
 
 
 def load_config() -> Config:
