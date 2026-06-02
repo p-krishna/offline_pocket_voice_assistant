@@ -13,6 +13,7 @@ from vad.silero import SileroGate
 from stt.whisper_cpp import WhisperCppSTT
 from llm.gemma import GemmaLLM
 from tts.kokoro import KokoroTTS
+from tts.earcon import play_wake, play_done
 
 
 class Pipeline:
@@ -146,6 +147,7 @@ class Pipeline:
                         self.recording           = list(self.pre_roll)
                         self.post_roll_queue     = deque(maxlen=post_roll_frames)
                         print(f"[{stamp()}] WakeWord detected: {self.cfg.wakeword} score={score:.3f}")
+                        play_wake() # "I'm listening" earcon
                     continue
 
                 # --- Post-wake: Silero decides end of utterance ---
@@ -223,6 +225,7 @@ class Pipeline:
                                 # --- TTS (sentence-by-sentence streaming) ---
                                 # Starts playing the first sentence before the rest is processed.
                                 self.tts.speak_streaming(response)
+                                play_done() # "done speaking" earcon
 
                         except Exception as e:
                             # One of the servers failed. Speak the configured fallback phrase
