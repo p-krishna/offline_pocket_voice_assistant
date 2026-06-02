@@ -1,4 +1,5 @@
 import io
+import re
 import struct
 import time
 import urllib.request
@@ -22,7 +23,7 @@ class KokoroTTS:
 
     # this helper method — avoids duplicating the PyAudio logic in beep fallback:
     def _play_wav_bytes(self, wav_bytes: bytes) -> None:
-        """Play raw WAV bytes via PyAudio. Shared by speak() and the beep fallback."""
+        """Play raw WAV bytes via PyAudio. Shared by speak() and beep fallback."""
         buf = io.BytesIO(wav_bytes)
         audio_data, sample_rate = sf.read(buf, dtype="float32")
         pcm = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
@@ -36,11 +37,9 @@ class KokoroTTS:
     # this method — stdlib only, no server needed:
     def _play_beep(self) -> None:
         """
-        Play a short 440 Hz beep directly via PyAudio.
+        Play a short 440 Hz beep via PyAudio using stdlib only.
         Last-resort fallback when the TTS server is unreachable.
-        The visually impaired user must always hear *something*.
         """
-        
         rate, duration_ms, freq = 22050, 350, 440
         n = int(rate * duration_ms / 1000)
         samples = [int(32767 * math.sin(2 * math.pi * freq * i / rate)) for i in range(n)]
@@ -53,31 +52,34 @@ class KokoroTTS:
         buf.seek(0)
         self._play_wav_bytes(buf.read())
 
-    # Rewrite speak() to use self.timeout and call _play_beep on failure:
-    def speak(self, text):
-        if not text:
-            return
-
-        # Send text to Kokoro TTS server and receive raw WAV bytes.
+    def _synthesize(self, text: str) -> bytes | None:
+        """
+        Send one text chunk to Kokoro server, return WAV bytes.
+        Returns None and plays a beep on failure.
+        """
         payload = json.dumps({"text": text, "voice": self.voice}).encode("utf-8")
         req = urllib.request.Request(
             f"{self.url}/synthesize",
             data=payload,
             headers={"Content-Type": "application/json"},
         )
-
         try:
-            # CHANGE: use self.timeout instead of hardcoded 30.
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                wav_bytes = resp.read()
+                return resp.read()
         except Exception as e:
             print(f"[TTS] Request failed: {e}")
-            # play a beep so the user knows something went wrong.
-            # Silence is never acceptable for a visually impaired user.
             try:
                 self._play_beep()
             except Exception as beep_err:
                 print(f"[TTS] Beep fallback also failed: {beep_err}")
+            return None
+
+    def speak(self, text: str) -> None:
+        """Synthesize full text in one request and play it. Used for short fallback phrases."""
+        if not text:
+            return
+        wav_bytes = self._synthesize(text)
+        if wav_bytes is None:
             return
 
         # Save WAV to disk.
@@ -88,6 +90,35 @@ class KokoroTTS:
         # Play via the shared helper.
         self._play_wav_bytes(wav_bytes)
         print(f"[TTS] Played: {text[:60]}...")
+
+    def speak_streaming(self, text: str) -> None:
+        """
+        Split text into sentences and synthesize + play each one immediately.
+        This cuts perceived latency — audio starts before the full response is ready.
+        Each sentence is a separate HTTP request to the Kokoro server.
+
+        Used for normal LLM responses. speak() is still used for short fallback phrases
+        where splitting would produce awkward pauses.
+        """
+        if not text:
+            return
+
+        # Split on sentence boundaries: . ! ? followed by space or end of string.
+        # Keeps the punctuation attached to the sentence before the split.
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+
+        # If no sentence boundaries found (e.g. a single short answer), speak whole text.
+        if not sentences:
+            self.speak(text)
+            return
+
+        for sentence in sentences:
+            wav_bytes = self._synthesize(sentence)
+            if wav_bytes is None:
+                # One sentence failed — stop here, beep already played inside _synthesize.
+                break
+            self._play_wav_bytes(wav_bytes)
+            print(f"[TTS] Streamed: {sentence[:60]}...")
 
 
 # --- Standalone test ---
@@ -102,7 +133,8 @@ if __name__ == "__main__":
 
     cfg = load_config()
     tts = KokoroTTS(cfg)
-    tts.speak(
-        "Hello! This is a test of the Kokoro TTS server. "
-        "If you can hear this, the text to speech server is working correctly."
+    tts.speak_streaming(
+        "Hello! This is a streaming test of the Kokoro TTS server. "
+        "Each sentence should start playing immediately. "
+        "If you hear all three sentences, streaming is working correctly."
     )
