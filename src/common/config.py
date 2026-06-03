@@ -106,6 +106,13 @@ class Config:
     # Only applies after utterance_floor_ms has passed.
     silero_early_exit_threshold: float = float(os.environ.get("SILERO_EARLY_EXIT_THRESHOLD", "0.15"))
 
+    interrupt_min_speech_ms    = 1000     # 1s sustained speech before interrupt fires
+    interrupt_energy_threshold = 0.02     # RMS floor to filter breath/hiss
+    conversation_timeout_s     = 45       # silence after TTS → back to idle
+    conversation_warning_s     = 5        # "going to sleep soon" plays 5s before timeout
+    system_voice               = "af"     # voice for status phrases
+    response_voice             = "af"     # voice for LLM responses
+
 
 def load_config() -> Config:
     raw_models  = os.getenv('WAKEWORD_MODEL_PATHS', '').strip()
