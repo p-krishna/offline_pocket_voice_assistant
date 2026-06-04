@@ -10,9 +10,12 @@ Shared state:
   interrupt_queue   Queue(1)  — T1 puts interrupt samples, T2 gets them
   cancel_event      Event     — T1 sets when interrupt confirmed; T2 checks between sentences
   is_speaking       Event     — T2 sets during TTS; T1 enables interrupt detection
+  processing_busy   Event     — T2 sets during STT/LLM/TTS for a normal turn
   conversation_mode Event     — set after wake word; cleared after 45s silence
 """
 
+import io
+import re
 import threading
 import queue
 import time
@@ -21,17 +24,19 @@ from collections import deque
 from pathlib import Path
 from wave import open as wave_open
 
+import pyaudio
+import soundfile as sf
+
 from common import stamp
 from common.config import load_config
-from common.servers import wait_for_servers, SERVERS, _ping, _start
-from vad.webrtc import WebRTCGate
-from wakeword.listen import WakeWordListener
-from vad.silero import SileroGate
-from stt.whisper_cpp import WhisperCppSTT
+from common.servers import SERVERS, _ping, _start, wait_for_servers
 from llm.gemma import GemmaLLM
+from stt.whisper_cpp import WhisperCppSTT
 from tts.kokoro import KokoroTTS
 from tts.phrases import PhrasePlayer
-
+from vad.silero import SileroGate
+from vad.webrtc import WebRTCGate
+from wakeword.listen import WakeWordListener
 
 # Whisper tokens that mean "nothing was said" — never send these to the LLM.
 BLANK_TOKENS = {"[BLANK_AUDIO]", "[SILENCE]", "(silence)", "(ambient noise)"}
@@ -74,26 +79,41 @@ class Pipeline:
         # T2 → T1: set while TTS is playing. Enables interrupt detection in T1.
         self.is_speaking = threading.Event()
 
+        # T2 → T1: set while processing a normal turn.
+        # Prevents T1 from starting a fresh capture too early.
+        self.processing_busy = threading.Event()
+
         # Shared: set after wake word fires; cleared after conversation timeout.
         self.conversation_mode = threading.Event()
+
+        # Hard cooldown after assistant/system audio so the assistant does not
+        # hear itself and immediately start a fresh turn.
+        self.cooldown_until = 0.0
+
+        # Shared timestamp used by conversation timeout.
+        self._last_tts_end_time = None
 
         # Clean shutdown signal for both threads.
         self.running = threading.Event()
         self.running.set()
 
-    # ── Debug helpers ─────────────────────────────────────────────────────────
-
+    # ------------------------------------------------------------------
+    # Debug helpers
+    # ------------------------------------------------------------------
     def save_debug_wav(self, samples, prefix="utterance") -> None:
         if not self.cfg.debug_save_wav or not samples:
             return
+
         out_dir = Path(self.cfg.debug_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{prefix}_{int(time.time())}.wav"
+
         with wave_open(str(path), "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(self.cfg.sample_rate)
             wf.writeframes(np.concatenate(samples).astype(np.int16).tobytes())
+
         print(f"[{stamp()}] Debug WAV saved: {path}")
 
     # ── RMS energy helper ─────────────────────────────────────────────────────
@@ -102,80 +122,91 @@ class Pipeline:
     def _rms(frames: list) -> float:
         """
         Compute normalised RMS energy of a list of int16 numpy frames.
-        Returns a value in [0.0, 1.0]. Used to filter low-energy noise
-        that Silero might classify as speech.
+        Returns a value in [0.0, 1.0]. Used to filter low-energy noise.
         """
         if not frames:
             return 0.0
         combined = np.concatenate(frames).astype(np.float32) / 32768.0
         return float(np.sqrt(np.mean(combined ** 2)))
 
-    # ── Thread 1: Audio ───────────────────────────────────────────────────────
+    def _set_cooldown(self, seconds: float | None = None) -> None:
+        """Ignore mic input for a short period after assistant/system audio."""
+        self.cooldown_until = time.monotonic() + (seconds or self.cfg.assistant_audio_cooldown_s)
 
+    # ------------------------------------------------------------------
+    # Thread 1: Audio
+    # ------------------------------------------------------------------
     def _audio_thread(self, stream) -> None:
         """
         Continuously reads mic frames.
 
-        Pre-wake:  WebRTC gate → openWakeWord detection.
+        Pre-wake: WebRTC gate → openWakeWord detection.
         Post-wake: Silero utterance capture → enqueue for processing.
-        Interrupt: While T2 is speaking, monitor for 1000ms sustained speech
-                   with energy above threshold → signal T2 to cancel.
-        Conversation timeout: 45s silence after TTS → back to idle.
+        Interrupt: While T2 is speaking, monitor for sustained speech with
+        energy above threshold → signal T2 to cancel.
+        Conversation timeout: silence after TTS → back to idle.
         """
 
-        # ── Per-utterance state (reset on each cycle) ─────────────────────────
-        after_wake       = False
-        silence_frames   = 0
-        command_start    = None
-        silero_buf       = np.zeros(0, dtype=np.int16)
-        recording        = []
+        # Per-utterance state.
+        after_wake = False
+        silence_frames = 0
+        command_start = None
+        silero_buf = np.zeros(0, dtype=np.int16)
+        recording = []
+        current_capture_from_conversation = False
 
-        # Pre-roll: capture audio just before wake word so first syllable
+        # Pre-roll: capture audio just before wake word so the first syllable
         # of the command is not clipped.
-        pre_roll_frames = max(1, int(
-            (self.cfg.utterance_pre_roll_ms / 1000)
-            * self.cfg.sample_rate / self.webrtc.frame_samples
-        ))
+        pre_roll_frames = max(
+            1,
+            int((self.cfg.utterance_pre_roll_ms / 1000) * self.cfg.sample_rate / self.webrtc.frame_samples),
+        )
         pre_roll = deque(maxlen=pre_roll_frames)
 
-        post_roll_frames = max(1, int(
-            (self.cfg.utterance_post_roll_ms / 1000)
-            * self.cfg.sample_rate / self.webrtc.frame_samples
-        ))
+        # Post-roll: keep a little tail after final silence.
+        post_roll_frames = max(
+            1,
+            int((self.cfg.utterance_post_roll_ms / 1000) * self.cfg.sample_rate / self.webrtc.frame_samples),
+        )
         post_roll_queue = deque(maxlen=post_roll_frames)
 
-        # ── Interrupt detection state ─────────────────────────────────────────
-        # Tracks sustained speech during TTS playback to detect real interrupts.
-        interrupt_speech_ms   = 0.0   # accumulated confirmed-speech duration
-        interrupt_recording   = []    # frames captured during potential interrupt
-        interrupt_silero      = SileroGate()  # separate Silero instance for interrupt path
-        interrupt_silero_buf  = np.zeros(0, dtype=np.int16)
+        # Conversation-mode re-entry gating.
+        conversation_reentry_hits = 0
 
-        # ── Conversation timeout state ────────────────────────────────────────
-        last_tts_end_time   = None   # monotonic time when TTS last finished
-        warning_played      = False  # prevent replaying the warning
+        # Interrupt detection state.
+        interrupt_speech_ms = 0.0
+        interrupt_recording = []
+        interrupt_silero = SileroGate()
+        interrupt_silero_buf = np.zeros(0, dtype=np.int16)
+        interrupt_active = False
 
-        def reset_utterance_state():
+        # Conversation timeout state.
+        warning_played = False
+
+        def reset_utterance_state() -> None:
             nonlocal after_wake, silence_frames, command_start
-            nonlocal silero_buf, recording
-            after_wake     = False
+            nonlocal silero_buf, recording, current_capture_from_conversation
+            after_wake = False
             silence_frames = 0
-            command_start  = None
-            self.silero.state      = None
+            command_start = None
+            current_capture_from_conversation = False
+            self.silero.state = None
             self.silero.started_at = None
-            self.silero.history    = []
+            self.silero.history = []
             silero_buf = np.zeros(0, dtype=np.int16)
-            recording  = []
-            pre_roll.clear()
+            recording = []
+            post_roll_queue.clear()
 
-        def reset_interrupt_state():
-            nonlocal interrupt_speech_ms, interrupt_recording, interrupt_silero_buf
-            interrupt_speech_ms  = 0.0
-            interrupt_recording  = []
+        def reset_interrupt_state() -> None:
+            nonlocal interrupt_speech_ms, interrupt_recording
+            nonlocal interrupt_silero_buf, interrupt_active
+            interrupt_speech_ms = 0.0
+            interrupt_recording = []
             interrupt_silero_buf = np.zeros(0, dtype=np.int16)
-            interrupt_silero.state      = None
+            interrupt_active = False
+            interrupt_silero.state = None
             interrupt_silero.started_at = None
-            interrupt_silero.history    = []
+            interrupt_silero.history = []
 
         frame_duration_ms = (self.webrtc.frame_samples / self.cfg.sample_rate) * 1000
 
@@ -184,37 +215,42 @@ class Pipeline:
             t     = time.monotonic()
             frame = np.frombuffer(pcm, dtype=np.int16)
 
-            pre_roll.append(frame)
+            # Keep rolling pre-roll while idle.
+            if not after_wake:
+                pre_roll.append(frame)
 
-            # ── Conversation timeout check ────────────────────────────────────
-            # Only runs when in conversation mode and T2 is idle.
-            if (self.conversation_mode.is_set()
-                    and not self.is_speaking.is_set()
-                    and not after_wake
-                    and last_tts_end_time is not None):
+            # Hard cooldown after assistant/system speech.
+            if t < self.cooldown_until:
+                continue
 
-                silent_for = t - last_tts_end_time
-                timeout    = self.cfg.conversation_timeout_s
+            # Conversation timeout only when truly idle.
+            if (
+                self.conversation_mode.is_set()
+                and not self.is_speaking.is_set()
+                and not self.processing_busy.is_set()
+                and not after_wake
+                and self._last_tts_end_time is not None
+            ):
+                silent_for = t - self._last_tts_end_time
+                timeout = self.cfg.conversation_timeout_s
                 warning_at = timeout - self.cfg.conversation_warning_s
 
                 if not warning_played and silent_for >= warning_at:
-                    # Play warning phrase — "Going to sleep soon".
                     self.phrases.play("going_to_sleep")
+                    self._set_cooldown()
                     warning_played = True
 
                 if silent_for >= timeout:
-                    # Timeout fired — exit conversation mode.
                     self.phrases.play("goodbye")
+                    self._set_cooldown()
                     self.conversation_mode.clear()
-                    last_tts_end_time = None
-                    warning_played    = False
+                    self._last_tts_end_time = None
+                    warning_played = False
                     reset_utterance_state()
                     print(f"[{stamp()}] Conversation timeout — returning to idle")
                     continue
 
-            # ── Interrupt detection (while T2 is speaking) ────────────────────
-            # Uses a separate Silero instance + RMS energy gate.
-            # Requires interrupt_min_speech_ms of sustained speech before firing.
+            # Interrupt detection while assistant is speaking.
             if self.is_speaking.is_set() and self.conversation_mode.is_set():
                 interrupt_recording.append(frame)
                 interrupt_silero_buf = np.concatenate([interrupt_silero_buf, frame])
@@ -237,82 +273,95 @@ class Pipeline:
                     #   2. RMS energy above threshold (filters hiss/breath noise)
                     if interrupt_speech_ms >= self.cfg.interrupt_min_speech_ms:
                         rms = self._rms(interrupt_recording)
-                        if rms >= self.cfg.interrupt_energy_threshold:
+                        if rms >= self.cfg.interrupt_energy_threshold and not interrupt_active:
+                            interrupt_active = True
                             print(f"[{stamp()}] Interrupt detected (rms={rms:.4f})")
-                            self.phrases.play("i_heard_you")
-
-                            # Hand interrupt audio to T2 via interrupt_queue.
                             try:
                                 self.interrupt_queue.put_nowait(list(interrupt_recording))
                             except queue.Full:
-                                pass  # T2 already has a pending interrupt
-
-                            # Signal T2 to stop TTS.
+                                pass
                             self.cancel_event.set()
+                            self._set_cooldown()
                             reset_interrupt_state()
-                        else:
-                            # Energy too low — discard and reset.
-                            print(f"[{stamp()}] Interrupt suppressed: low energy (rms={rms:.4f})")
+                        elif rms < self.cfg.interrupt_energy_threshold:
                             reset_interrupt_state()
-                continue  # while speaking, skip normal wake/utterance path
 
-            # Reset interrupt state when T2 is not speaking.
-            if not self.is_speaking.is_set():
-                reset_interrupt_state()
+                continue
 
-            # ── Pre-wake: WebRTC silence gate ─────────────────────────────────
+            # Reset interrupt state when not speaking.
+            reset_interrupt_state()
+
+            # Pre-wake path.
             if not after_wake and not self.conversation_mode.is_set():
                 is_speech = self.webrtc.vad.is_speech(pcm, self.webrtc.sample_rate)
                 new_webrtc_state = "speech" if is_speech else "silence"
 
                 if self.webrtc.state is None:
-                    self.webrtc.state      = new_webrtc_state
+                    self.webrtc.state = new_webrtc_state
                     self.webrtc.started_at = t
                     print(f"[{stamp()}] WebRTC {new_webrtc_state} (start)")
                 elif new_webrtc_state != self.webrtc.state:
                     old = self.webrtc.state
-                    print(f"[{stamp()}] WebRTC {old} -> {new_webrtc_state} "
-                          f"after {t - self.webrtc.started_at:.2f}s")
-                    self.webrtc.state      = new_webrtc_state
+                    print(
+                        f"[{stamp()}] WebRTC {old} -> {new_webrtc_state} "
+                        f"after {t - self.webrtc.started_at:.2f}s"
+                    )
+                    self.webrtc.state = new_webrtc_state
                     self.webrtc.started_at = t
 
                 if self.webrtc.state != "speech":
                     continue
 
-                # ── Wake word detection ───────────────────────────────────────
                 score = self.wake.model.predict(frame).get(self.cfg.wakeword, 0.0)
                 self.wake.hits = (self.wake.hits + 1) if score >= self.wake.threshold else 0
 
                 if self.wake.hits >= self.wake.trigger_level:
                     self.wake.hits = 0
-                    after_wake     = True
-                    command_start  = t
-                    silero_buf     = np.zeros(0, dtype=np.int16)
+                    after_wake = True
+                    current_capture_from_conversation = False
+                    command_start = t
+                    silero_buf = np.zeros(0, dtype=np.int16)
                     silence_frames = 0
-                    self.silero.state      = None
+                    self.silero.state = None
                     self.silero.started_at = None
-                    self.silero.history    = []
-                    recording       = list(pre_roll)
+                    self.silero.history = []
+                    recording = list(pre_roll)
                     post_roll_queue = deque(maxlen=post_roll_frames)
                     self.conversation_mode.set()
+                    warning_played = False
                     print(f"[{stamp()}] WakeWord detected: {self.cfg.wakeword} score={score:.3f}")
                     self.phrases.play("listening")
+                    self._set_cooldown()
+                    continue
 
-                continue  # always skip post-wake section on this frame
-
-            # ── Post-wake: Silero utterance capture ───────────────────────────
-            # Also entered directly if already in conversation_mode (no wake needed).
+            # Conversation-mode re-entry.
             if not after_wake and self.conversation_mode.is_set():
-                # Conversation mode re-entry: start a fresh utterance capture.
-                after_wake    = True
+                if self.processing_busy.is_set() or self.is_speaking.is_set():
+                    continue
+
+                is_speech = self.webrtc.vad.is_speech(pcm, self.webrtc.sample_rate)
+                if not is_speech:
+                    conversation_reentry_hits = 0
+                    continue
+
+                conversation_reentry_hits += 1
+                if conversation_reentry_hits < self.cfg.conversation_reentry_start_hits:
+                    continue
+
+                after_wake = True
+                current_capture_from_conversation = True
                 command_start = t
-                silero_buf    = np.zeros(0, dtype=np.int16)
+                silero_buf = np.zeros(0, dtype=np.int16)
                 silence_frames = 0
-                self.silero.state      = None
+                self.silero.state = None
                 self.silero.started_at = None
-                self.silero.history    = []
-                recording       = list(pre_roll)
+                self.silero.history = []
+                recording = list(pre_roll)
                 post_roll_queue = deque(maxlen=post_roll_frames)
+                conversation_reentry_hits = 0
+
+            if not after_wake:
+                continue
 
             recording.append(frame)
             post_roll_queue.append(frame)
@@ -328,17 +377,28 @@ class Pipeline:
                     if old_state is None:
                         print(f"[{stamp()}] Silero {new_state} (start) avg={avg:.3f}")
                     else:
-                        print(f"[{stamp()}] Silero {old_state} -> {new_state} "
-                              f"after {t2 - started:.2f}s avg={avg:.3f}")
+                        print(
+                            f"[{stamp()}] Silero {old_state} -> {new_state} "
+                            f"after {t2 - started:.2f}s avg={avg:.3f}"
+                        )
 
-                silence_frames = (silence_frames + 1) if self.silero.state == "silence" else 0
+                silence_frames = (
+                    silence_frames + 1 if self.silero.state == "silence" else 0
+                )
 
                 command_age_ms = (t - command_start) * 1000 if command_start else 0
                 enough_silence = silence_frames >= self.cfg.silero_stop_silence_frames
                 enough_time    = command_age_ms >= self.cfg.utterance_min_ms
                 past_floor     = command_age_ms >= self.cfg.utterance_floor_ms
                 very_silent    = avg < self.cfg.silero_early_exit_threshold
-                early_exit     = past_floor and very_silent and enough_silence
+
+                # Early exit is allowed only for the first wake-triggered utterance.
+                early_exit = (
+                    past_floor
+                    and very_silent
+                    and enough_silence
+                    and not current_capture_from_conversation
+                )
 
                 if (enough_time and enough_silence) or early_exit:
                     if early_exit and not enough_time:
@@ -349,31 +409,47 @@ class Pipeline:
                     samples = recording + list(post_roll_queue)
                     self.save_debug_wav(samples)
 
-                    # Try to enqueue. If T2 is still processing the previous
-                    # command, drop this one and tell the user.
+                    # Tiny, low-energy captures are almost always noise.
+                    # Drop them quietly instead of saying "please wait".
+                    capture_rms = self._rms(samples)
+                    if command_age_ms < self.cfg.utterance_reject_ms or capture_rms < self.cfg.utterance_reject_rms:
+                        print(
+                            f"[{stamp()}] REJECTED Utterance"
+                            f"(age={command_age_ms:.0f}ms rms={capture_rms:.4f})"
+                        )
+                        reset_utterance_state()
+                        break
+                    else:
+                        print(
+                            f"[{stamp()}] ACCEPTED Utterance"
+                            f"(age={command_age_ms:.0f}ms rms={capture_rms:.4f})"
+                        )
+
                     try:
                         self.utterance_queue.put_nowait(samples)
                     except queue.Full:
                         print(f"[{stamp()}] Utterance dropped — T2 still busy")
                         self.phrases.play("please_wait")
+                        self._set_cooldown()
 
                     reset_utterance_state()
                     break
 
-    # ── Thread 2: Processing ──────────────────────────────────────────────────
-
+    # ------------------------------------------------------------------
+    # Thread 2: Processing
+    # ------------------------------------------------------------------
     def _processing_thread(self) -> None:
         """
         Waits for utterances from T1, runs STT → LLM → TTS.
         Checks cancel_event between TTS sentences.
         On cancel: stops TTS, picks up interrupt from interrupt_queue,
-                   builds combined transcript, reruns LLM.
+        builds combined transcript, reruns LLM.
         """
 
         def _transcribe_samples(samples) -> str | None:
             """
             Run STT. Returns clean transcript string, or None if blank/noise.
-            Plays 'repeat_that' phrase on blank result.
+            Blank audio is ignored quietly to avoid a speech loop.
             """
             try:
                 transcript = self.stt.transcribe(samples, self.cfg.sample_rate)
@@ -384,20 +460,19 @@ class Pipeline:
             print(f"[{stamp()}] Transcript: {transcript}")
 
             if not transcript or not transcript.strip() or transcript.strip() in BLANK_TOKENS:
-                self.phrases.play("repeat_that")
                 return None
 
             return transcript.strip()
 
-        def _run_llm(combined_transcript: str) -> str | None:
+        def _run_llm(user_text: str) -> str | None:
             """
             Play 'thinking', call LLM with history.
-            Returns response string or None on error.
-            """
+            Returns response or None."""
             self.phrases.play("thinking")
+            self._set_cooldown()
             try:
                 response = self.llm.generate(
-                    combined_transcript,
+                    user_text,
                     history=list(self.history)[:-1],
                 )
                 print(f"[{stamp()}] LLM: {response}")
@@ -409,12 +484,10 @@ class Pipeline:
         def _speak_with_cancel(response: str) -> bool:
             """
             Play response sentence by sentence.
-            Checks cancel_event after each sentence.
-            Returns True if playback completed, False if cancelled mid-way.
-            Stops PyAudio immediately on cancel (mid-sentence cutoff).
+            Checks cancel_event after each sentence and between audio chunks.
+            Returns True if playback completed, False if cancelled.
             """
-            import re, io
-            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', response) if s.strip()]
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", response) if s.strip()]
             if not sentences:
                 sentences = [response]
 
@@ -435,16 +508,13 @@ class Pipeline:
                     print(f"[{stamp()}] TTS cancelled after synthesis: {sentence[:40]}")
                     return False
 
-                # Play the sentence through PyAudio.
-                # We replicate _play_wav_bytes here so we can honour cancel_event
-                # between chunks rather than blocking for the full sentence.
-                import soundfile as sf
                 buf        = io.BytesIO(wav)
                 audio_data, sample_rate = sf.read(buf, dtype="float32")
                 pcm        = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
-                pa         = __import__("pyaudio").PyAudio()
+
+                pa         = pyaudio.PyAudio()
                 stream     = pa.open(
-                    format=__import__("pyaudio").paInt16,
+                    format=pyaudio.paInt16,
                     channels=1,
                     rate=sample_rate,
                     output=True,
@@ -473,39 +543,38 @@ class Pipeline:
 
                 print(f"[{stamp()}] TTS streamed: {sentence[:60]}...")
 
-            return True  # all sentences played
+            return True
 
         while self.running.is_set():
-            # Wait for an utterance from T1 (0.5s timeout to stay responsive to shutdown).
             try:
                 samples = self.utterance_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-            # ── STT ──────────────────────────────────────────────────────────
+            self.processing_busy.set()
+
             transcript = _transcribe_samples(samples)
             if transcript is None:
-                continue  # blank audio — 'repeat_that' already played
+                self.processing_busy.clear()
+                continue
 
-            # Save user message immediately (even if LLM fails, history knows
-            # what was asked).
             self.history.append({"role": "user", "content": transcript})
 
-            # ── LLM ──────────────────────────────────────────────────────────
             response = _run_llm(transcript)
             if response is None:
-                # LLM failed — speak fallback, attempt server restart.
+                self.processing_busy.clear()
                 self._handle_server_error()
                 continue
 
-            # Save truncated assistant response to history.
-            self.history.append({
-                "role": "assistant",
-                "content": response[:self.cfg.memory_assistant_max_chars],
-            })
+            self.history.append(
+                {
+                    "role": "assistant",
+                    "content": response[: self.cfg.memory_assistant_max_chars],
+                }
+            )
 
-            # ── TTS with interrupt handling ───────────────────────────────────
             self.cancel_event.clear()
+            self.processing_busy.clear()
             self.is_speaking.set()
 
             completed = _speak_with_cancel(response)
@@ -525,13 +594,18 @@ class Pipeline:
                     # Interrupt signal arrived but no audio — treat as fresh
                     # listen cycle.
                     print(f"[{stamp()}] Interrupt with no audio — resuming listen")
+                    self._set_cooldown()
+                    self._last_tts_end_time = time.monotonic()
                     continue
 
-                # Transcribe interrupt audio.
+                self.processing_busy.set()
                 interrupt_transcript = _transcribe_samples(interrupt_samples)
                 if interrupt_transcript is None:
                     # Interrupt was noise — continue conversation normally.
                     print(f"[{stamp()}] Interrupt transcribed as blank — continuing")
+                    self.processing_busy.clear()
+                    self._set_cooldown()
+                    self._last_tts_end_time = time.monotonic()
                     continue
 
                 # Build combined transcript: original + spoken correction.
@@ -545,20 +619,23 @@ class Pipeline:
                 if len(self.history) >= 2:
                     self.history.pop()  # remove assistant response
                     self.history.pop()  # remove original user message
-                self.history.append({"role": "user", "content": combined})
+                    self.history.append({"role": "user", "content": combined})
 
-                # Fresh LLM call with updated history.
                 response = _run_llm(combined)
                 if response is None:
+                    self.processing_busy.clear()
                     self._handle_server_error()
                     continue
 
-                self.history.append({
-                    "role": "assistant",
-                    "content": response[:self.cfg.memory_assistant_max_chars],
-                })
+                self.history.append(
+                    {
+                        "role": "assistant",
+                        "content": response[: self.cfg.memory_assistant_max_chars],
+                    }
+                )
 
                 self.cancel_event.clear()
+                self.processing_busy.clear()
                 self.is_speaking.set()
                 _speak_with_cancel(response)
                 self.is_speaking.clear()
@@ -566,9 +643,11 @@ class Pipeline:
 
             # Record when TTS last finished — drives conversation timeout.
             self._last_tts_end_time = time.monotonic()
+            self._set_cooldown()
 
-    # ── Server error recovery ─────────────────────────────────────────────────
-
+    # ------------------------------------------------------------------
+    # Server error recovery
+    # ------------------------------------------------------------------
     def _handle_server_error(self) -> None:
         """Check all servers, restart any that are down, play fallback phrase."""
         for srv in SERVERS:
@@ -576,34 +655,37 @@ class Pipeline:
                 print(f"[{stamp()}] {srv['name']} down — restarting...")
                 _start(srv)
                 time.sleep(3)
+
         try:
             self.tts.speak(self.cfg.fallback_phrase)
+            self._set_cooldown()
         except Exception as e:
             print(f"[{stamp()}] Fallback TTS failed: {e}")
 
-    # ── Entry point ───────────────────────────────────────────────────────────
-
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
     def run(self) -> None:
-        print("Pipeline: WebRTC -> openWakeWord -> Silero -> "
-              "Whisper[8081] -> Gemma[8080] -> Kokoro[8082]")
-        print(f"wakeword={self.cfg.wakeword}  sample_rate={self.cfg.sample_rate}")
-        print(f"memory_turns={self.cfg.memory_turns}  "
-              f"utterance_floor_ms={self.cfg.utterance_floor_ms}")
-        print(f"conversation_timeout={self.cfg.conversation_timeout_s}s  "
-              f"interrupt_min_speech={self.cfg.interrupt_min_speech_ms}ms")
+        print(
+            "Pipeline: WebRTC -> openWakeWord -> Silero -> "
+            "Whisper[8081] -> Gemma[8080] -> Kokoro[8082]"
+        )
+        print(f"wakeword={self.cfg.wakeword} sample_rate={self.cfg.sample_rate}")
+        print(
+            f"memory_turns={self.cfg.memory_turns} "
+            f"utterance_floor_ms={self.cfg.utterance_floor_ms}"
+        )
+        print(
+            f"conversation_timeout={self.cfg.conversation_timeout_s}s "
+            f"interrupt_min_speech={self.cfg.interrupt_min_speech_ms}ms"
+        )
 
-        # Block until all three servers respond.
         wait_for_servers()
-
-        # Pre-synthesize all system phrases (uses disk cache when available).
         self.phrases.warm_up()
 
         print("Press Ctrl+C to stop.")
 
         audio, stream = self.webrtc.open()
-
-        # Share last_tts_end_time between T2 and T1 via instance variable.
-        self._last_tts_end_time = None
 
         t1 = threading.Thread(
             target=self._audio_thread,
