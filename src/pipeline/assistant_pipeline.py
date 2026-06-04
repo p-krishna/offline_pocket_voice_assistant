@@ -264,7 +264,7 @@ class Pipeline:
                     if new_state == "speech":
                         interrupt_speech_ms += frame_duration_ms
                     else:
-                        # Reset counter — speech must be *sustained*, not sporadic.
+                        # Speech must be sustained, not sporadic.
                         interrupt_speech_ms = 0.0
                         interrupt_recording = []
 
@@ -392,7 +392,8 @@ class Pipeline:
                 past_floor     = command_age_ms >= self.cfg.utterance_floor_ms
                 very_silent    = avg < self.cfg.silero_early_exit_threshold
 
-                # Early exit is allowed only for the first wake-triggered utterance.
+                # Early exit is allowed only for the first wake-triggered utterance,
+                # not for conversation-mode re-entry captures.
                 early_exit = (
                     past_floor
                     and very_silent
@@ -484,66 +485,93 @@ class Pipeline:
         def _speak_with_cancel(response: str) -> bool:
             """
             Play response sentence by sentence.
-            Checks cancel_event after each sentence and between audio chunks.
+            Checks cancel_event before each sentence and between playback chunks.
             Returns True if playback completed, False if cancelled.
             """
             sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", response) if s.strip()]
             if not sentences:
                 sentences = [response]
 
-            for sentence in sentences:
-                # Check for interrupt before synthesizing next sentence.
-                if self.cancel_event.is_set():
-                    print(f"[{stamp()}] TTS cancelled before sentence: {sentence[:40]}")
-                    return False
+            pa = pyaudio.PyAudio()
+            stream = None
 
-                wav = self.tts._synthesize(sentence)
-                if wav is None:
-                    # Synthesis failed — beep already played inside _synthesize.
-                    return False
-
-                # Check again before playing — interrupt may have arrived
-                # during the synthesis HTTP call.
-                if self.cancel_event.is_set():
-                    print(f"[{stamp()}] TTS cancelled after synthesis: {sentence[:40]}")
-                    return False
-
-                buf        = io.BytesIO(wav)
-                audio_data, sample_rate = sf.read(buf, dtype="float32")
-                pcm        = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
-
-                pa         = pyaudio.PyAudio()
-                stream     = pa.open(
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=sample_rate,
-                    output=True,
-                    frames_per_buffer=4096,
-                )
-
-                # Write in 4096-sample chunks, checking cancel_event each time.
-                chunk_size = 4096
-                offset     = 0
-                cancelled  = False
-                while offset < len(pcm):
+            try:
+                for i, sentence in enumerate(sentences):
+                    # Stop before synthesis if interrupt already happened.
                     if self.cancel_event.is_set():
-                        print(f"[{stamp()}] TTS cut mid-sentence")
-                        cancelled = True
-                        break
-                    end    = min(offset + chunk_size, len(pcm))
-                    stream.write(pcm[offset:end].tobytes())
-                    offset = end
+                        print(f"[{stamp()}] TTS cancelled before sentence: {sentence[:40]}")
+                        return False
 
-                stream.stop_stream()
-                stream.close()
-                pa.terminate()
+                    wav = self.tts._synthesize(sentence)
+                    if wav is None:
+                        return False
 
-                if cancelled:
-                    return False
+                    # Stop if interrupt happened during synth HTTP call.
+                    if self.cancel_event.is_set():
+                        print(f"[{stamp()}] TTS cancelled after synthesis: {sentence[:40]}")
+                        return False
 
-                print(f"[{stamp()}] TTS streamed: {sentence[:60]}...")
+                    buf = io.BytesIO(wav)
+                    audio_data, sample_rate = sf.read(buf, dtype="float32")
 
-            return True
+                    # Handle mono/stereo safely.
+                    if getattr(audio_data, "ndim", 1) > 1:
+                        channels = audio_data.shape[1]
+                    else:
+                        channels = 1
+
+                    pcm = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
+
+                    # Open stream once, reuse for all sentences.
+                    if stream is None:
+                        stream = pa.open(
+                            format=pyaudio.paInt16,
+                            channels=channels,
+                            rate=sample_rate,
+                            output=True,
+                            frames_per_buffer=1024,
+                        )
+
+                    chunk_size = 1024
+                    offset = 0
+
+                    while offset < len(pcm):
+                        if self.cancel_event.is_set():
+                            print(f"[{stamp()}] TTS cut mid-sentence")
+                            stream.stop_stream()
+                            return False
+
+                        end = min(offset + chunk_size, len(pcm))
+                        chunk = pcm[offset:end]
+
+                        if channels > 1:
+                            stream.write(chunk.tobytes())
+                        else:
+                            stream.write(chunk.tobytes())
+
+                        offset = end
+
+                    print(f"[{stamp()}] TTS streamed: {sentence[:60]}...")
+
+                    # Small natural pause between sentences.
+                    if i < len(sentences) - 1:
+                        time.sleep(0.05)
+
+                return True
+
+            finally:
+                if stream is not None:
+                    try:
+                        # On normal completion, do not call stop_stream().
+                        # Close lets the playback drain cleanly.
+                        stream.close()
+                    except Exception as e:
+                        print(f"[{stamp()}] TTS stream close error: {e}")
+
+                try:
+                    pa.terminate()
+                except Exception as e:
+                    print(f"[{stamp()}] TTS terminate error: {e}")
 
         while self.running.is_set():
             try:

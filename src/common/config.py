@@ -40,18 +40,25 @@ class Config:
     # Minimum ms before any early finalization is allowed.
     utterance_floor_ms: int = int(os.getenv("UTTERANCE_FLOOR_MS", "700"))
 
-    # Silero avg probability below this means very confident silence.
+    # Silero avg probability below this means very confident silence → allow early exit.
     silero_early_exit_threshold: float = float(os.getenv("SILERO_EARLY_EXIT_THRESHOLD", "0.05"))
 
-    # Reject tiny weak captures quietly instead of turning them into STT requests.
-    utterance_reject_ms: int = int(os.getenv("UTTERANCE_REJECT_MS", "300"))
-    utterance_reject_rms: float = float(os.getenv("UTTERANCE_REJECT_RMS", "0.005"))
+    # Reject tiny, weak captures quietly instead of turning them into STT requests.
+    utterance_reject_ms: int = int(os.getenv("UTTERANCE_REJECT_MS", "500"))
+    utterance_reject_rms: float = float(os.getenv("UTTERANCE_REJECT_RMS", "0.003"))
 
-    # Conversation-mode re-entry should require fresh speech, not just active mode.
+    # Conversation-mode re-entry: require this many fresh WebRTC speech frames
+    # before starting a new capture (prevents immediate re-triggers after TTS).
     conversation_reentry_start_hits: int = int(os.getenv("CONVERSATION_REENTRY_START_HITS", "3"))
 
-    # Cooldown after assistant/system audio so we do not hear ourselves.
+    # Seconds to ignore mic after any assistant/system audio.
     assistant_audio_cooldown_s: float = float(os.getenv("ASSISTANT_AUDIO_COOLDOWN_S", "1.2"))
+
+    # Extra seconds to sleep after writing all PCM samples to PyAudio before
+    # calling stop_stream(). This drains the hardware output buffer so the
+    # last ~0.2-0.5 s of each TTS sentence is not clipped.
+    # Set to 0.0 to disable (restores old clipping behaviour).
+    tts_drain_extra_s: float = float(os.getenv("TTS_DRAIN_EXTRA_S", "0.15"))
 
     # --- Debug ---
     debug_mode:                        bool  = os.getenv("DEBUG_MODE", "1") == "1"
