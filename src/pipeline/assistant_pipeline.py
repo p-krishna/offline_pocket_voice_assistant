@@ -252,19 +252,30 @@ class Pipeline:
 
             # Interrupt detection while assistant is speaking.
             if self.is_speaking.is_set() and self.conversation_mode.is_set():
+                # append frame for interrupt detection
                 interrupt_recording.append(frame)
+                # Silero gate on the interrupt buffer to detect sustained speech.
                 interrupt_silero_buf = np.concatenate([interrupt_silero_buf, frame])
 
+                # while we have enough audio for Silero, check for sustained speech in the interrupt buffer
                 while len(interrupt_silero_buf) >= interrupt_silero.chunk_size:
+                    # use Silero to detect if there's sustained speech in the interrupt buffer
                     chunk = interrupt_silero_buf[:interrupt_silero.chunk_size]
+                    # remove the chunk from the buffer so the next iteration checks the next chunk
                     interrupt_silero_buf = interrupt_silero_buf[interrupt_silero.chunk_size:]
+                    # predict speech probability with Silero on the chunk
                     prob = interrupt_silero.predict(chunk.tobytes())
+                    # update Silero state and get the new state
                     _, new_state, _, _, _, _ = interrupt_silero.update(prob)
 
+                    # if Silero detects speech
                     if new_state == "speech":
+                        # increment the interrupt speech duration with the chunk duration
                         interrupt_speech_ms += frame_duration_ms
+                    # if Silero detects silence
                     else:
                         # Speech must be sustained, not sporadic.
+                        # Reset the interrupt speech duration and recording
                         interrupt_speech_ms = 0.0
                         interrupt_recording = []
 
@@ -278,6 +289,7 @@ class Pipeline:
                             print(f"[{stamp()}] Interrupt detected (rms={rms:.4f})")
                             try:
                                 self.interrupt_queue.put_nowait(list(interrupt_recording))
+                                print(f"[{stamp()}] Interrupt audio enqueued ({len(interrupt_recording) / self.webrtc.sample_rate:.2f}) seconds)")
                             except queue.Full:
                                 pass
                             self.cancel_event.set()
@@ -336,14 +348,18 @@ class Pipeline:
 
             # Conversation-mode re-entry.
             if not after_wake and self.conversation_mode.is_set():
+                # Prevent immediate re-trigger if we're still processing or speaking the previous turn.
                 if self.processing_busy.is_set() or self.is_speaking.is_set():
                     continue
 
+                # Require sustained speech with WebRTC to re-enter, to avoid noise-triggered false wakes.
                 is_speech = self.webrtc.vad.is_speech(pcm, self.webrtc.sample_rate)
                 if not is_speech:
                     conversation_reentry_hits = 0
                     continue
 
+                # Note: we intentionally do not use Silero for conversation re-entry gating, to keep it 
+                # more responsive and less likely to get stuck in silence if Silero misses the start of speech.
                 conversation_reentry_hits += 1
                 if conversation_reentry_hits < self.cfg.conversation_reentry_start_hits:
                     continue
