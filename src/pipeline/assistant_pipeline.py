@@ -97,6 +97,19 @@ class Pipeline:
         self.running = threading.Event()
         self.running.set()
 
+        # ── Day 1 Metrics counters ────────────────────────────────────────────
+        # All counters are for the lifetime of the pipeline process.
+        # Thread-safety: only _audio_thread writes wake/drop counters;
+        # only _processing_thread writes stt/llm/tts/interrupt counters.
+        # No lock needed because each counter has a single writer.
+        self._m_turns              = 0   # completed turn attempts (samples dequeued)
+        self._m_dropped            = 0   # utterances dropped — queue full
+        self._m_false_wakes        = 0   # wakes that produced no valid utterance
+        self._m_blank_stt          = 0   # STT returned blank / noise token
+        self._m_interrupt_detected = 0   # interrupt threshold crossed (T1 side)
+        self._m_interrupt_success  = 0   # interrupt -> non-blank transcript used
+        self._m_server_restarts    = 0   # server restart attempts
+
     # ------------------------------------------------------------------
     # Debug helpers
     # ------------------------------------------------------------------
@@ -292,6 +305,8 @@ class Pipeline:
                                 print(f"[{stamp()}] Interrupt audio enqueued ({len(interrupt_recording) / self.webrtc.sample_rate:.2f}) seconds)")
                             except queue.Full:
                                 pass
+                            # Count detection here (T1 side — single writer for this counter).
+                            self._m_interrupt_detected += 1
                             self.cancel_event.set()
                             self._set_cooldown()
                             reset_interrupt_state()
@@ -434,6 +449,8 @@ class Pipeline:
                             f"[{stamp()}] REJECTED Utterance"
                             f"(age={command_age_ms:.0f}ms rms={capture_rms:.4f})"
                         )
+                        # A wake fired but the capture was too short/quiet — count as false wake.
+                        self._m_false_wakes += 1
                         reset_utterance_state()
                         break
                     else:
@@ -445,6 +462,8 @@ class Pipeline:
                     try:
                         self.utterance_queue.put_nowait(samples)
                     except queue.Full:
+                        # T2 still processing previous turn — this utterance is lost.
+                        self._m_dropped += 1
                         print(f"[{stamp()}] Utterance dropped — T2 still busy")
                         self.phrases.play("please_wait")
                         self._set_cooldown()
@@ -559,12 +578,7 @@ class Pipeline:
 
                         end = min(offset + chunk_size, len(pcm))
                         chunk = pcm[offset:end]
-
-                        if channels > 1:
-                            stream.write(chunk.tobytes())
-                        else:
-                            stream.write(chunk.tobytes())
-
+                        stream.write(chunk.tobytes())
                         offset = end
 
                     print(f"[{stamp()}] TTS streamed: {sentence[:60]}...")
@@ -597,14 +611,29 @@ class Pipeline:
 
             self.processing_busy.set()
 
+            # ── Turn start timestamp ──────────────────────────────────────────
+            # Monotonic clock: unaffected by system clock adjustments.
+            _turn_start = time.monotonic()
+            self._m_turns += 1
+
+            # ── STT ───────────────────────────────────────────────────────────
+            _stt_t0 = time.monotonic()
             transcript = _transcribe_samples(samples)
+            _stt_ms = (time.monotonic() - _stt_t0) * 1000.0
+
             if transcript is None:
+                # Blank STT result — count it and skip this turn.
+                self._m_blank_stt += 1
                 self.processing_busy.clear()
                 continue
 
             self.history.append({"role": "user", "content": transcript})
 
+            # ── LLM ───────────────────────────────────────────────────────────
+            _llm_t0 = time.monotonic()
             response = _run_llm(transcript)
+            _llm_ms = (time.monotonic() - _llm_t0) * 1000.0
+
             if response is None:
                 self.processing_busy.clear()
                 self._handle_server_error()
@@ -621,9 +650,30 @@ class Pipeline:
             self.processing_busy.clear()
             self.is_speaking.set()
 
+            # ── TTS ───────────────────────────────────────────────────────────
+            _tts_t0 = time.monotonic()
             completed = _speak_with_cancel(response)
+            _tts_ms = (time.monotonic() - _tts_t0) * 1000.0
 
             self.is_speaking.clear()
+
+            # ── Per-turn metrics log line ─────────────────────────────────────
+            # Printed after every turn so the terminal becomes the baseline log.
+            # Format matches docs/metrics.md so manual test recordings stay consistent.
+            _total_ms = (time.monotonic() - _turn_start) * 1000.0
+            if self.cfg.metrics_enabled:
+                print(
+                    f"[{stamp()}] METRICS "
+                    f"turn={self._m_turns} "
+                    f"stt={_stt_ms:.0f}ms "
+                    f"llm={_llm_ms:.0f}ms "
+                    f"tts={_tts_ms:.0f}ms "
+                    f"total={_total_ms:.0f}ms "
+                    f"dropped={self._m_dropped} "
+                    f"blank_stt={self._m_blank_stt} "
+                    f"false_wakes={self._m_false_wakes} "
+                    f"interrupts_ok={self._m_interrupt_success}"
+                )
 
             if not completed:
                 # ── Interrupt path ────────────────────────────────────────────
@@ -651,6 +701,9 @@ class Pipeline:
                     self._set_cooldown()
                     self._last_tts_end_time = time.monotonic()
                     continue
+
+                # Interrupt produced a usable transcript — count as success.
+                self._m_interrupt_success += 1
 
                 # Build combined transcript: original + spoken correction.
                 # "Actually, ..." is a strong correction signal for small LLMs.
@@ -697,6 +750,8 @@ class Pipeline:
         for srv in SERVERS:
             if not _ping(srv["url"]):
                 print(f"[{stamp()}] {srv['name']} down — restarting...")
+                # Count every restart attempt for the metrics exit summary.
+                self._m_server_restarts += 1
                 _start(srv)
                 time.sleep(3)
 
@@ -760,6 +815,21 @@ class Pipeline:
             stream.stop_stream()
             stream.close()
             audio.terminate()
+
+            # ── Exit summary ──────────────────────────────────────────────────
+            # Printed once on graceful shutdown (Ctrl+C or clean exit).
+            # Record these numbers as your Week 1 baseline in docs/metrics.md.
+            if self.cfg.metrics_exit_summary:
+                print("\n── Metrics Summary ──────────────────────────────────────")
+                print(f"  Turns completed        : {self._m_turns}")
+                print(f"  Dropped utterances     : {self._m_dropped}")
+                print(f"  Blank STT results      : {self._m_blank_stt}")
+                print(f"  False wakes            : {self._m_false_wakes}")
+                print(f"  Interrupts detected    : {self._m_interrupt_detected}")
+                print(f"  Interrupts succeeded   : {self._m_interrupt_success}")
+                print(f"  Server restart attempts: {self._m_server_restarts}")
+                print("─────────────────────────────────────────────────────────\n")
+
             print("Stopped.")
 
 

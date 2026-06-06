@@ -125,6 +125,11 @@ class Config:
     system_voice: str = os.environ.get("SYSTEM_VOICE", "af")
     response_voice: str = os.environ.get("RESPONSE_VOICE", "af")
 
+    # Enable per-turn latency and counter logging to terminal.
+    metrics_enabled: bool = os.getenv("METRICS_ENABLED", "1") == "1"
+    # Print a cumulative summary when the pipeline exits cleanly.
+    metrics_exit_summary: bool = os.getenv("METRICS_EXIT_SUMMARY", "1") == "1"
+
 
 def load_config() -> Config:
     raw_models = os.getenv("WAKEWORD_MODEL_PATHS", "").strip()
