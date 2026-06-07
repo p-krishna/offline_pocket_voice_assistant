@@ -14,6 +14,7 @@ Shared state:
   conversation_mode Event     — set after wake word; cleared after 45s silence
 """
 
+import sys
 import io
 import re
 import threading
@@ -109,6 +110,84 @@ class Pipeline:
         self._m_interrupt_detected = 0   # interrupt threshold crossed (T1 side)
         self._m_interrupt_success  = 0   # interrupt -> non-blank transcript used
         self._m_server_restarts    = 0   # server restart attempts
+
+        # ------------------------------------------------------------------
+    # Startup validation helpers
+    # ------------------------------------------------------------------
+    def _validate_config(self) -> None:
+        """
+        Validate critical config: model paths, server URLs, ports.
+        Exit fast on misconfiguration so the user gets a clear error.
+        """
+
+        # Validate server URLs / ports from SERVERS table.
+        # This catches obvious port conflicts / bad URLs at startup.
+        seen_ports = set()
+        for srv in SERVERS:
+            url = srv.get("url", "")
+            name = srv.get("name", "unknown")
+            if "://" not in url:
+                print(f"[{stamp()}] Config error: invalid URL for {name}: {url}")
+                sys.exit(1)
+
+            # Very small parser: assume http://host:port
+            try:
+                host_port = url.split("://", 1)[1].split("/", 1)[0]
+                host, port_str = host_port.rsplit(":", 1)
+                port = int(port_str)
+            except Exception:
+                print(f"[{stamp()}] Config error: cannot parse port from {name} URL: {url}")
+                sys.exit(1)
+
+            if port in seen_ports:
+                print(f"[{stamp()}] Config error: duplicate port {port} in SERVERS")
+                sys.exit(1)
+            seen_ports.add(port)
+
+    def _validate_microphone(self) -> None:
+        """
+        Ensure the configured input device and sample rate are available
+        before starting audio / processing threads.
+        """
+        pa = pyaudio.PyAudio()
+        try:
+            device_index = getattr(self.cfg, "input_device_index", None)
+            sample_rate = int(self.cfg.sample_rate)
+
+            # If user pinned a device index, ensure it exists.
+            if device_index is not None:
+                try:
+                    info = pa.get_device_info_by_index(device_index)
+                except Exception as e:
+                    print(f"[{stamp()}] Audio error: input_device_index {device_index} invalid: {e}")
+                    sys.exit(1)
+                if info.get("maxInputChannels", 0) <= 0:
+                    print(f"[{stamp()}] Audio error: device {device_index} has no input channels")
+                    sys.exit(1)
+
+            # Try opening a tiny test stream to confirm sample-rate assumptions.
+            try:
+                test_stream = pa.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=sample_rate,
+                    input=True,
+                    input_device_index=device_index,
+                    frames_per_buffer=256,
+                )
+                test_stream.close()
+            except Exception as e:
+                print(
+                    f"[{stamp()}] Audio error: cannot open input stream at "
+                    f"{sample_rate} Hz (device={device_index}): {e}"
+                )
+                sys.exit(1)
+
+            print(
+                f"[{stamp()}] Audio OK: device={device_index} sample_rate={sample_rate}"
+            )
+        finally:
+            pa.terminate()
 
     # ------------------------------------------------------------------
     # Debug helpers
@@ -539,6 +618,12 @@ class Pipeline:
 
                     wav = self.tts._synthesize(sentence)
                     if wav is None:
+                        # TTS failed to synthesize this sentence.
+                        try:
+                            self.phrases.play("fallback_tts")
+                            self._set_cooldown()
+                        except Exception as e:
+                            print(f"[{stamp()}] TTS fallback phrase failed: {e}")
                         return False
 
                     # Stop if interrupt happened during synth HTTP call.
@@ -622,9 +707,14 @@ class Pipeline:
             _stt_ms = (time.monotonic() - _stt_t0) * 1000.0
 
             if transcript is None:
-                # Blank STT result — count it and skip this turn.
+                # Blank or failed STT — count it, speak specific fallback.
                 self._m_blank_stt += 1
                 self.processing_busy.clear()
+                try:
+                    self.phrases.play("fallback_stt")
+                    self._set_cooldown()
+                except Exception as e:
+                    print(f"[{stamp()}] STT fallback phrase failed: {e}")
                 continue
 
             self.history.append({"role": "user", "content": transcript})
@@ -636,6 +726,8 @@ class Pipeline:
 
             if response is None:
                 self.processing_busy.clear()
+                # _handle_server_error will now try restarts and play a
+                # specific LLM / generic fallback phrase.
                 self._handle_server_error()
                 continue
 
@@ -721,6 +813,8 @@ class Pipeline:
                 response = _run_llm(combined)
                 if response is None:
                     self.processing_busy.clear()
+                    # _handle_server_error will now try restarts and play a
+                    # specific LLM / generic fallback phrase.
                     self._handle_server_error()
                     continue
 
@@ -746,20 +840,62 @@ class Pipeline:
     # Server error recovery
     # ------------------------------------------------------------------
     def _handle_server_error(self) -> None:
-        """Check all servers, restart any that are down, play fallback phrase."""
-        for srv in SERVERS:
-            if not _ping(srv["url"]):
-                print(f"[{stamp()}] {srv['name']} down — restarting...")
-                # Count every restart attempt for the metrics exit summary.
-                self._m_server_restarts += 1
-                _start(srv)
-                time.sleep(3)
+        """
+        Check all servers, restart any that are down, with simple
+        retry + backoff. Then play a specific spoken fallback so the
+        user hears what went wrong.
+        """
+        failed_services = []
 
+        for srv in SERVERS:
+            name = srv.get("name", "unknown")
+            url = srv.get("url", "")
+            if _ping(url):
+                continue
+
+            print(f"[{stamp()}] {name} appears down at {url} — attempting restart...")
+            failed_services.append(name)
+
+            # Simple retry with exponential backoff.
+            max_attempts = 3
+            base_delay_s = 1.0
+            for attempt in range(1, max_attempts + 1):
+                self._m_server_restarts += 1
+                print(
+                    f"[{stamp()}] Restart attempt {attempt}/{max_attempts} for {name}"
+                )
+                _start(srv)
+
+                # Backoff: 1s, 2s, 4s.
+                delay = base_delay_s * (2 ** (attempt - 1))
+                time.sleep(delay)
+
+                if _ping(url):
+                    print(f"[{stamp()}] {name} is healthy again after restart")
+                    break
+            else:
+                print(f"[{stamp()}] {name} still unhealthy after {max_attempts} attempts")
+
+        # Choose a spoken fallback phrase based on what failed.
         try:
-            self.tts.speak(self.cfg.fallback_phrase)
+            if not failed_services:
+                # Generic failure – e.g., STT returned None but all services pinged OK.
+                self.phrases.play("fallback_generic")
+            else:
+                # Map service names to more specific fallbacks.
+                down = set(s.lower() for s in failed_services)
+                if any("whisper" in s or "stt" in s for s in down):
+                    self.phrases.play("fallback_stt")
+                elif any("gemma" in s or "llm" in s for s in down):
+                    self.phrases.play("fallback_llm")
+                elif any("kokoro" in s or "tts" in s for s in down):
+                    self.phrases.play("fallback_tts")
+                else:
+                    self.phrases.play("fallback_generic")
+
             self._set_cooldown()
         except Exception as e:
-            print(f"[{stamp()}] Fallback TTS failed: {e}")
+            print(f"[{stamp()}] Fallback phrase playback failed: {e}")
 
     # ------------------------------------------------------------------
     # Entry point
@@ -778,6 +914,10 @@ class Pipeline:
             f"conversation_timeout={self.cfg.conversation_timeout_s}s "
             f"interrupt_min_speech={self.cfg.interrupt_min_speech_ms}ms"
         )
+
+        # Validate configuration and audio hardware before touching servers.
+        self._validate_config()
+        self._validate_microphone()
 
         wait_for_servers()
         self.phrases.warm_up()
