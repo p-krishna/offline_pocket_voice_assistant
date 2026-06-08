@@ -530,6 +530,15 @@ class Pipeline:
                         )
                         # A wake fired but the capture was too short/quiet — count as false wake.
                         self._m_false_wakes += 1
+                        # Log a summary every N false wakes to help tune thresholds.
+                        interval = self.cfg.false_wake_log_interval
+                        if interval > 0 and self._m_false_wakes % interval == 0:
+                            print(
+                                f"[false-wake summary] total={self._m_false_wakes} "
+                                f"| cooldown={self.cfg.assistant_audio_cooldown_s}s "
+                                f"| reentry_hits={self.cfg.conversation_reentry_start_hits} "
+                                f"| interrupt_min_speech={self.cfg.interrupt_min_speech_ms}ms"
+                            )
                         reset_utterance_state()
                         break
                     else:
@@ -748,6 +757,10 @@ class Pipeline:
             _tts_ms = (time.monotonic() - _tts_t0) * 1000.0
 
             self.is_speaking.clear()
+            self.cancel_event.clear()
+            # Apply full post-TTS cooldown so mic ignores speaker hardware drain.
+            self._set_cooldown(self.cfg.assistant_audio_cooldown_s)
+            self.last_tts_end_time = time.monotonic()
 
             # ── Per-turn metrics log line ─────────────────────────────────────
             # Printed after every turn so the terminal becomes the baseline log.
@@ -828,6 +841,9 @@ class Pipeline:
                 self.cancel_event.clear()
                 self.processing_busy.clear()
                 self.is_speaking.set()
+                # Guard window at the START of TTS playback so the opening phrase
+                # doesn't self-trigger the wake word listener.
+                self._set_cooldown(self.cfg.tts_playback_guard_s)
                 _speak_with_cancel(response)
                 self.is_speaking.clear()
                 self.cancel_event.clear()

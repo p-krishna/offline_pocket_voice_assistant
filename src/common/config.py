@@ -49,16 +49,25 @@ class Config:
 
     # Conversation-mode re-entry: require this many fresh WebRTC speech frames
     # before starting a new capture (prevents immediate re-triggers after TTS).
-    conversation_reentry_start_hits: int = int(os.getenv("CONVERSATION_REENTRY_START_HITS", "3"))
+    conversation_reentry_start_hits: int = int(os.getenv("CONVERSATION_REENTRY_START_HITS", "5"))
+    # Sustained WebRTC speech frames required before re-entering conversation.
+    # Higher = harder to accidentally re-trigger after TTS. Tune with noisy env logs.
 
     # Seconds to ignore mic after any assistant/system audio.
-    assistant_audio_cooldown_s: float = float(os.getenv("ASSISTANT_AUDIO_COOLDOWN_S", "1.2"))
+    assistant_audio_cooldown_s: float = float(os.getenv("ASSISTANT_AUDIO_COOLDOWN_S", "2.0"))
+    # Seconds to ignore mic after any assistant/system audio.
+    # 2.0s gives speaker hardware time to drain + avoids self-hearing TTS tail.
 
     # Extra seconds to sleep after writing all PCM samples to PyAudio before
     # calling stop_stream(). This drains the hardware output buffer so the
     # last ~0.2-0.5 s of each TTS sentence is not clipped.
     # Set to 0.0 to disable (restores old clipping behaviour).
     tts_drain_extra_s: float = float(os.getenv("TTS_DRAIN_EXTRA_S", "0.15"))
+
+    tts_playback_guard_s: float = float(os.getenv("TTS_PLAYBACK_GUARD_S", "0.5"))
+    # Extra cooldown applied at the START of TTS playback (during speaking).
+    # Prevents wake word false triggers caused by the opening of the TTS phrase.
+    # This stacks with assistant_audio_cooldown_s (applied at end of TTS).
 
     # --- Debug ---
     debug_mode:                        bool  = os.getenv("DEBUG_MODE", "1") == "1"
@@ -127,6 +136,11 @@ class Config:
 
     # Enable per-turn latency and counter logging to terminal.
     metrics_enabled: bool = os.getenv("METRICS_ENABLED", "1") == "1"
+
+    false_wake_log_interval: int = int(os.getenv("FALSE_WAKE_LOG_INTERVAL", "10"))
+    # Log a false-wake summary every N false wake events.
+    # Set to 0 to disable interval logging (still logged at exit).
+
     # Print a cumulative summary when the pipeline exits cleanly.
     metrics_exit_summary: bool = os.getenv("METRICS_EXIT_SUMMARY", "1") == "1"
 
