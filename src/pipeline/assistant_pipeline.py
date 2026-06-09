@@ -22,6 +22,7 @@ import queue
 import time
 import numpy as np
 from collections import deque
+import json
 from pathlib import Path
 from wave import open as wave_open
 
@@ -103,13 +104,14 @@ class Pipeline:
         # Thread-safety: only _audio_thread writes wake/drop counters;
         # only _processing_thread writes stt/llm/tts/interrupt counters.
         # No lock needed because each counter has a single writer.
-        self._m_turns              = 0   # completed turn attempts (samples dequeued)
-        self._m_dropped            = 0   # utterances dropped — queue full
-        self._m_false_wakes        = 0   # wakes that produced no valid utterance
-        self._m_blank_stt          = 0   # STT returned blank / noise token
-        self._m_interrupt_detected = 0   # interrupt threshold crossed (T1 side)
-        self._m_interrupt_success  = 0   # interrupt -> non-blank transcript used
-        self._m_server_restarts    = 0   # server restart attempts
+        self._m_turns              = 0     # completed turn attempts (samples dequeued)
+        self._m_dropped            = 0     # utterances dropped — queue full
+        self._m_false_wakes        = 0     # wakes that produced no valid utterance
+        self._m_blank_stt          = 0     # STT returned blank / noise token
+        self._m_interrupt_detected = 0     # interrupt threshold crossed (T1 side)
+        self._m_interrupt_success  = 0     # interrupt -> non-blank transcript used
+        self._m_server_restarts    = 0     # server restart attempts
+        self._last_debug_wav       = None  # reset each turn; set by save_debug_wav
 
         # ------------------------------------------------------------------
     # Startup validation helpers
@@ -207,6 +209,24 @@ class Pipeline:
             wf.writeframes(np.concatenate(samples).astype(np.int16).tobytes())
 
         print(f"[{stamp()}] Debug WAV saved: {path}")
+
+        # Store path so _log_turn can reference it for this turn
+        self._last_debug_wav = path
+    
+    def _log_turn(self, turn_data: dict) -> None:
+        """
+        Append one JSON line per turn to a daily JSONL file.
+        Each line is a self-contained record — easy to grep, stream, or replay.
+        Fields: ts, turn, transcript, response_chars, stt_ms, llm_ms, tts_ms,
+                total_ms, interrupted, failed, debug_wav
+        """
+        log_dir = Path(self.cfg.turnlogdir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # One file per day so logs don't grow unbounded
+        day = time.strftime("%Y-%m-%d")
+        log_path = log_dir / f"turns_{day}.jsonl"
+        with open(log_path, "a") as f:
+            f.write(json.dumps(turn_data) + "\n")
 
     # ── RMS energy helper ─────────────────────────────────────────────────────
 
@@ -705,6 +725,8 @@ class Pipeline:
 
             self.processing_busy.set()
 
+            self._last_debug_wav = None   # reset at start of each new turn
+
             # ── Turn start timestamp ──────────────────────────────────────────
             # Monotonic clock: unaffected by system clock adjustments.
             _turn_start = time.monotonic()
@@ -779,6 +801,21 @@ class Pipeline:
                     f"false_wakes={self._m_false_wakes} "
                     f"interrupts_ok={self._m_interrupt_success}"
                 )
+                # Collect all timing + outcome data for this turn into one record.
+                # debug_wav is the path saved by save_debug_wav (may be None if disabled).
+                self._log_turn({
+                    "ts":            time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "turn":          self.m_turns,
+                    "transcript":    transcript or "",
+                    "response_chars": len(response) if response else 0,
+                    "stt_ms":        round(_stt_ms, 1),
+                    "llm_ms":        round(_llm_ms, 1),
+                    "tts_ms":        round(_tts_ms, 1),
+                    "total_ms":      round(_total_ms, 1),
+                    "interrupted":   not completed,
+                    "failed":        response is None,
+                    "debug_wav":     str(self._last_debug_wav) if self._last_debug_wav else None,
+                })
 
             if not completed:
                 # ── Interrupt path ────────────────────────────────────────────

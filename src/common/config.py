@@ -73,6 +73,7 @@ class Config:
     debug_mode:                        bool  = os.getenv("DEBUG_MODE", "1") == "1"
     debug_save_wav:                    bool  = os.getenv("DEBUG_SAVE_WAV", "1") == "1"
     debug_dir:                         str   = os.getenv("DEBUG_DIR", "debug_audio")
+    turnlogdir:                        str   = os.getenv("TURN_LOG_DIR", "debug_logs")
 
     # --- STT: persistent whisper-server ---
     stt_server_url:                    str   = os.getenv("STT_SERVER_URL", "http://127.0.0.1:8081")
