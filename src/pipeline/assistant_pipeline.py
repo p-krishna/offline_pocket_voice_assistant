@@ -805,7 +805,7 @@ class Pipeline:
                 # debug_wav is the path saved by save_debug_wav (may be None if disabled).
                 self._log_turn({
                     "ts":            time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "turn":          self.m_turns,
+                    "turn":          self._m_turns,
                     "transcript":    transcript or "",
                     "response_chars": len(response) if response else 0,
                     "stt_ms":        round(_stt_ms, 1),
