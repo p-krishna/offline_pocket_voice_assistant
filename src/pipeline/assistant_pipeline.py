@@ -41,7 +41,7 @@ from vad.webrtc import WebRTCGate
 from wakeword.listen import WakeWordListener
 
 # Whisper tokens that mean "nothing was said" — never send these to the LLM.
-BLANK_TOKENS = {"[BLANK_AUDIO]", "[SILENCE]", "(silence)", "(ambient noise)"}
+BLANK_TOKENS = {"[BLANK_AUDIO]", "[SILENCE]", "(silence)", "(ambient noise)", "(birds chirping)"}
 
 
 class Pipeline:
@@ -606,7 +606,7 @@ class Pipeline:
             if not transcript or not transcript.strip() or transcript.strip() in BLANK_TOKENS:
                 return None
 
-            return transcript.strip()
+            return transcript.strip()        
 
         def _run_llm(user_text: str) -> str | None:
             """
@@ -748,6 +748,7 @@ class Pipeline:
                     print(f"[{stamp()}] STT fallback phrase failed: {e}")
                 continue
 
+            self._maybe_summarize_oldest()
             self.history.append({"role": "user", "content": transcript})
 
             # ── LLM ───────────────────────────────────────────────────────────
@@ -765,7 +766,7 @@ class Pipeline:
             self.history.append(
                 {
                     "role": "assistant",
-                    "content": response[: self.cfg.memory_assistant_max_chars],
+                    "content": self._trim_for_memory(response),
                 }
             )
 
@@ -871,7 +872,7 @@ class Pipeline:
                 self.history.append(
                     {
                         "role": "assistant",
-                        "content": response[: self.cfg.memory_assistant_max_chars],
+                        "content": self._trim_for_memory(response),
                     }
                 )
 
@@ -949,6 +950,41 @@ class Pipeline:
             self._set_cooldown()
         except Exception as e:
             print(f"[{stamp()}] Fallback phrase playback failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Memory management
+    # ------------------------------------------------------------------
+    def _maybe_summarize_oldest(self) -> None:
+        """If history is at capacity, shorten the oldest user message to a short
+        keyword stub so it still gives topic context without wasting token budget.
+        Only acts when the deque is full (all turns occupied)."""
+        max_msgs = self.cfg.memory_turns * 2
+        if len(self.history) < max_msgs:
+            return  # Still have room, nothing to compress
+        # The oldest entry is a user message (index 0 in the deque)
+        oldest = self.history[0]
+        if oldest["role"] == "user" and len(oldest["content"]) > 60:
+            # Compress to first 60 chars, trim to last word boundary
+            stub = oldest["content"][:60]
+            last_space = stub.rfind(' ')
+            if last_space > 20:
+                stub = stub[:last_space]
+            self.history[0] = {"role": "user", "content": f"[earlier: {stub}…]"}
+    
+    def _trim_for_memory(self, text: str) -> str:
+        """Keep only the first N chars of a reply, but end on a sentence boundary.
+        This avoids storing half-sentences that confuse the LLM on next turn."""
+        limit = self.cfg.memory_assistant_max_chars
+        if len(text) <= limit:
+            return text
+        # Find the last sentence-ending punctuation before the limit
+        cut = text.rfind('.', 0, limit)
+        if cut == -1:
+            cut = text.rfind('?', 0, limit)
+        if cut == -1:
+            cut = text.rfind('!', 0, limit)
+        # Fall back to hard cut if no punctuation found
+        return text[:cut + 1] if cut > 0 else text[:limit]
 
     # ------------------------------------------------------------------
     # Entry point

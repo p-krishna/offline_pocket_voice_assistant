@@ -120,8 +120,8 @@ class Config:
     )
 
     # --- Conversation memory ---
-    memory_turns: int = int(os.environ.get("MEMORY_TURNS", "3"))
-    memory_assistant_max_chars: int = int(os.environ.get("MEMORY_ASSISTANT_MAX_CHARS", "120"))
+    memory_turns: int = int(os.environ.get("MEMORY_TURNS", "2"))
+    memory_assistant_max_chars: int = int(os.environ.get("MEMORY_ASSISTANT_MAX_CHARS", "100"))
 
     # --- Interrupt tuning ---
     interrupt_min_speech_ms: int = int(os.environ.get("INTERRUPT_MIN_SPEECH_MS", "300"))
