@@ -20,6 +20,7 @@ import re
 import threading
 import queue
 import time
+import datetime
 import numpy as np
 from collections import deque
 import json
@@ -29,7 +30,7 @@ from wave import open as wave_open
 import pyaudio
 import soundfile as sf
 
-from common import stamp
+from common import stamp, _LatencyTracer
 from common.config import load_config
 from common.servers import SERVERS, _ping, _start, wait_for_servers
 from llm.gemma import GemmaLLM
@@ -48,6 +49,9 @@ class Pipeline:
     def __init__(self):
         # Single shared config — every stage reads from this.
         self.cfg = load_config()
+
+        self._tracer = _LatencyTracer()
+        self._last_response: str = ""   # for __REPEAT__ fast path
 
         # VAD / wake word components.
         self.webrtc = WebRTCGate()
@@ -113,7 +117,22 @@ class Pipeline:
         self._m_server_restarts    = 0     # server restart attempts
         self._last_debug_wav       = None  # reset each turn; set by save_debug_wav
 
-        # ------------------------------------------------------------------
+        self._FP = [
+            (re.compile(r'\b(what(?:\'s| is) the time|current time|what time is it)\b', re.I),
+            lambda: f"It's {datetime.now().strftime('%I:%M %p').lstrip('0')}"),
+            (re.compile(r'\b(today(?:\'s)? date|what(?:\'s| is) the date)\b', re.I),
+            lambda: f"Today is {datetime.now().strftime('%A, %B %d')}"),
+            (re.compile(r'\b(stop|cancel|nevermind|quit|exit|shut ?up)\b', re.I),
+            lambda: "__STOP__"),
+            (re.compile(r'\b(hello|hi there|hey there)\b', re.I),
+            lambda: "Hello! How can I help?"),
+            (re.compile(r'\b(thank(?:s| you))\b', re.I),
+            lambda: "You're welcome!"),
+            (re.compile(r'\b(repeat(?: that)?|say that again)\b', re.I),
+            lambda: "__REPEAT__"),
+        ]
+
+    # ------------------------------------------------------------------
     # Startup validation helpers
     # ------------------------------------------------------------------
     def _validate_config(self) -> None:
@@ -456,8 +475,10 @@ class Pipeline:
                     self.conversation_mode.set()
                     warning_played = False
                     print(f"[{stamp()}] WakeWord detected: {self.cfg.wakeword} score={score:.3f}")
-                    self.phrases.play("listening")
-                    self._set_cooldown()
+                    threading.Thread(
+                        target=lambda: (self.phrases.play("listening"), self._set_cooldown()),
+                        daemon=True
+                    ).start()
                     continue
 
             # Conversation-mode re-entry.
@@ -612,8 +633,10 @@ class Pipeline:
             """
             Play 'thinking', call LLM with history.
             Returns response or None."""
-            self.phrases.play("thinking")
-            self._set_cooldown()
+            threading.Thread(
+                target=lambda: (self.phrases.play("thinking"), self._set_cooldown()),
+                daemon=True
+            ).start()
             try:
                 response = self.llm.generate(
                     user_text,
@@ -720,6 +743,7 @@ class Pipeline:
         while self.running.is_set():
             try:
                 samples = self.utterance_queue.get(timeout=0.5)
+                self._tracer.reset(); self._tracer.mark("dequeue")
             except queue.Empty:
                 continue
 
@@ -735,6 +759,7 @@ class Pipeline:
             # ── STT ───────────────────────────────────────────────────────────
             _stt_t0 = time.monotonic()
             transcript = _transcribe_samples(samples)
+            self._tracer.mark("stt_done")
             _stt_ms = (time.monotonic() - _stt_t0) * 1000.0
 
             if transcript is None:
@@ -748,27 +773,41 @@ class Pipeline:
                     print(f"[{stamp()}] STT fallback phrase failed: {e}")
                 continue
 
-            self._maybe_summarize_oldest()
-            self.history.append({"role": "user", "content": transcript})
+            fast_result = self._try_fast_path(transcript)
+            self._tracer.mark("response_ready")
+            _llm_ms = 0.0
 
-            # ── LLM ───────────────────────────────────────────────────────────
-            _llm_t0 = time.monotonic()
-            response = _run_llm(transcript)
-            _llm_ms = (time.monotonic() - _llm_t0) * 1000.0
-
-            if response is None:
+            if fast_result == "__STOP__":
+                self.conversation_mode.clear()
+                self._last_tts_end_time = None
                 self.processing_busy.clear()
-                # _handle_server_error will now try restarts and play a
-                # specific LLM / generic fallback phrase.
-                self._handle_server_error()
+                self.phrases.play("goodbye")
+                self._set_cooldown()
                 continue
 
-            self.history.append(
-                {
-                    "role": "assistant",
-                    "content": self._trim_for_memory(response),
-                }
-            )
+            elif fast_result == "__REPEAT__":
+                response = self._last_response or "I don't have anything to repeat."
+                self.history.append({"role": "user", "content": transcript})
+
+            elif fast_result is not None:
+                response = fast_result
+                self._last_response = response
+                self.history.append({"role": "user", "content": transcript})
+                self.history.append({"role": "assistant", "content": response})
+
+            else:                                # Normal LLM path
+                self._maybe_summarize_oldest()
+                self.history.append({"role": "user", "content": transcript})
+                _llm_t0 = time.monotonic()
+                response = _run_llm(transcript)
+                self._tracer.mark("response_ready")
+                _llm_ms = (time.monotonic() - _llm_t0) * 1000.0
+                if response is None:
+                    self.processing_busy.clear()
+                    self._handle_server_error()
+                    continue
+                self.history.append({"role": "assistant", "content": self._trim_for_memory(response)})
+                self._last_response = response
 
             self.cancel_event.clear()
             self.processing_busy.clear()
@@ -777,6 +816,9 @@ class Pipeline:
             # ── TTS ───────────────────────────────────────────────────────────
             _tts_t0 = time.monotonic()
             completed = _speak_with_cancel(response)
+            self._tracer.mark("tts_done")
+            if self.cfg.metrics_enabled:
+                print(f"[LATENCY] {self._tracer.report()}")
             _tts_ms = (time.monotonic() - _tts_t0) * 1000.0
 
             self.is_speaking.clear()
@@ -862,6 +904,7 @@ class Pipeline:
                     self.history.append({"role": "user", "content": combined})
 
                 response = _run_llm(combined)
+                self._tracer.mark("response_ready")
                 if response is None:
                     self.processing_busy.clear()
                     # _handle_server_error will now try restarts and play a
@@ -985,6 +1028,18 @@ class Pipeline:
             cut = text.rfind('!', 0, limit)
         # Fall back to hard cut if no punctuation found
         return text[:cut + 1] if cut > 0 else text[:limit]
+
+    
+
+    def _try_fast_path(self, transcript: str) -> str | None:
+        if not getattr(self.cfg, 'fast_path_enabled', True):
+            return None
+        for pattern, handler in self._FP:
+            if pattern.search(transcript):
+                result = handler()
+                print(f"[FastPath] {result[:60]}")
+                return result
+        return None
 
     # ------------------------------------------------------------------
     # Entry point
