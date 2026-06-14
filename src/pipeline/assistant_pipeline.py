@@ -42,7 +42,7 @@ from vad.webrtc import WebRTCGate
 from wakeword.listen import WakeWordListener
 
 # Whisper tokens that mean "nothing was said" — never send these to the LLM.
-BLANK_TOKENS = {"[BLANK_AUDIO]", "[SILENCE]", "(silence)", "(ambient noise)", "(birds chirping)"}
+BLANK_TOKENS = {"[BLANK_AUDIO]", "[SILENCE]", "[MUSIC]", "(silence)", "(ambient noise)", "(birds chirping)", "(chuckles)", "(speaking in foreign language)"}
 
 
 class Pipeline:
@@ -132,9 +132,44 @@ class Pipeline:
             lambda: "__REPEAT__"),
         ]
 
-        # Pre-baked interrupt earcon: descending two-tone beep, ~180 ms.
-        self._interrupt_earcon_pcm = self._make_interrupt_earcon(
-            self.cfg.sample_rate)
+        ## Pre-synthesise earcons at startup for instant playback when needed.
+        sr = self.cfg.sample_rate
+
+        # WAKE DETECTED — ascending two-tone (mirror of interrupt)
+        # 660 Hz → 880 Hz, 90 ms each: "something woke up, going up"
+        self.wake_earcon_pcm = self._make_earcon(
+            [(660, 0.09), (880, 0.09)], sr
+        )
+
+        # LISTENING STARTED — single short high pip
+        # 1046 Hz (C6), 70 ms: crisp, attention-grabbing "ready now"
+        self.listening_earcon_pcm = self._make_earcon(
+            [(1046, 0.07)], sr, amplitude=10000
+        )
+
+        # THINKING — two soft rising pulses, slower
+        # 523 Hz → 659 Hz → 784 Hz, 100 ms each: "working on it"
+        self.thinking_earcon_pcm = self._make_earcon(
+            [(523, 0.10), (659, 0.10), (784, 0.10)], sr, amplitude=9000
+        )
+
+        # INTERRUPT — descending two-tone, quick and attention-grabbing but not too harsh.
+        # 880 Hz → 660 Hz, 90 ms each: "something interrupted me, going down"
+        self.interrupt_earcon_pcm = self._make_earcon(
+            [(880, 0.09), (660, 0.09)], sr   # descending — barge-in registered
+        )
+
+        # ERROR — descending tritone, slightly longer
+        # 440 Hz → 311 Hz → 220 Hz, 100 ms each: "something went wrong"
+        self.error_earcon_pcm = self._make_earcon(
+            [(440, 0.10), (311, 0.10), (220, 0.10)], sr, amplitude=11000
+        )
+
+        # SLEEP / GOODBYE — slow falling three-tone
+        # 880 Hz → 523 Hz → 330 Hz, 120 ms each: "going away"
+        self.sleep_earcon_pcm = self._make_earcon(
+            [(880, 0.12), (523, 0.12), (330, 0.12)], sr, amplitude=11000
+        )
 
     # ------------------------------------------------------------------
     # Startup validation helpers
@@ -287,17 +322,47 @@ class Pipeline:
         self.cooldown_until = time.monotonic() + (seconds or self.cfg.assistant_audio_cooldown_s)
 
     @staticmethod
-    def _make_interrupt_earcon(sample_rate: int) -> np.ndarray:
-        """880 Hz → 660 Hz descending two-tone, 180 ms, int16, ~40% volume."""
-        dur = int(sample_rate * 0.09)   # 90 ms per tone
-        t   = np.linspace(0, 0.09, dur, endpoint=False)
-        hi  = np.sin(2 * np.pi * 880 * t)
-        lo  = np.sin(2 * np.pi * 660 * t)
-        wave = np.concatenate([hi, lo])
-        fade = int(sample_rate * 0.005)
-        wave[:fade]  *= np.linspace(0, 1, fade)
-        wave[-fade:] *= np.linspace(1, 0, fade)
-        return (wave * 13000).astype(np.int16)   # 40% of 32767
+    def _make_earcon(
+        tones: list[tuple[float, float]],  # [(freq_hz, duration_s), ...]
+        samplerate: int,
+        amplitude: int = 13000,            # out of 32767; 13000 ≈ 40%
+        fade_ms: float = 5.0,              # ms for fade-in on first / fade-out on last tone
+    ) -> np.ndarray:
+        """
+        Synthesise a multi-tone earcon from a list of (freq_hz, duration_s) pairs.
+        Each tone is a pure sine wave. The first tone gets a fade-in and the last
+        tone gets a fade-out (fade_ms each), so the earcon never clicks.
+        Returns an int16 numpy array ready for PyAudio output.
+        """
+        segments = []
+        fade_samples = int(samplerate * fade_ms / 1000)
+
+        for i, (freq, dur) in enumerate(tones):
+            n = int(samplerate * dur)
+            t = np.linspace(0, dur, n, endpoint=False)
+            wave = np.sin(2 * np.pi * freq * t)
+
+            if i == 0 and fade_samples > 0:                         # fade-in on first
+                wave[:fade_samples] *= np.linspace(0, 1, fade_samples)
+            if i == len(tones) - 1 and fade_samples > 0:            # fade-out on last
+                wave[-fade_samples:] *= np.linspace(1, 0, fade_samples)
+
+            segments.append(wave)
+
+        combined = np.concatenate(segments)
+        return (combined * amplitude).astype(np.int16)
+    
+    def _play_earcon(self, pcm: np.ndarray) -> None:
+        """Play a pre-baked earcon PCM array in a daemon thread (non-blocking)."""
+        def _play():
+            pa = pyaudio.PyAudio()
+            st = pa.open(format=pyaudio.paInt16, channels=1,
+                        rate=self.cfg.sample_rate, output=True)
+            st.write(pcm.tobytes())
+            st.stop_stream(); st.close(); pa.terminate()
+        threading.Thread(target=_play, daemon=True).start()
+
+
     # ------------------------------------------------------------------
     # Thread 1: Audio
     # ------------------------------------------------------------------
@@ -401,11 +466,13 @@ class Pipeline:
                 warning_at = timeout - self.cfg.conversation_warning_s
 
                 if not warning_played and silent_for >= warning_at:
+                    self._play_earcon(self.sleep_earcon_pcm)
                     self.phrases.play("going_to_sleep")
                     self._set_cooldown()
                     warning_played = True
 
                 if silent_for >= timeout:
+                    self._play_earcon(self.sleep_earcon_pcm)
                     self.phrases.play("goodbye")
                     self._set_cooldown()
                     self.conversation_mode.clear()
@@ -513,7 +580,11 @@ class Pipeline:
                     warning_played = False
                     print(f"[{stamp()}] WakeWord detected: {self.cfg.wakeword} score={score:.3f}")
                     threading.Thread(
-                        target=lambda: (self.phrases.play("listening"), self._set_cooldown()),
+                        target=lambda: (
+                            self._play_earcon(self.wake_earcon_pcm),
+                            self.phrases.play("listening"),
+                            self._set_cooldown()
+                        ),
                         daemon=True
                     ).start()
                     continue
@@ -547,6 +618,7 @@ class Pipeline:
                 recording = list(pre_roll)
                 post_roll_queue = deque(maxlen=post_roll_frames)
                 conversation_reentry_hits = 0
+                self._play_earcon(self.listening_earcon_pcm)
 
             if not after_wake:
                 continue
@@ -671,7 +743,11 @@ class Pipeline:
             Play 'thinking', call LLM with history.
             Returns response or None."""
             threading.Thread(
-                target=lambda: (self.phrases.play("thinking"), self._set_cooldown()),
+                target=lambda: (
+                    self._play_earcon(self.thinking_earcon_pcm),
+                    self.phrases.play("thinking"),
+                    self._set_cooldown()
+                ),
                 daemon=True
             ).start()
             try:
@@ -709,6 +785,7 @@ class Pipeline:
                     if wav is None:
                         # TTS failed to synthesize this sentence.
                         try:
+                            self._play_earcon(self.error_earcon_pcm)
                             self.phrases.play("fallback_tts")
                             self._set_cooldown()
                         except Exception as e:
@@ -814,6 +891,7 @@ class Pipeline:
                 self._m_blank_stt += 1
                 self.processing_busy.clear()
                 try:
+                    self._play_earcon(self.error_earcon_pcm)
                     self.phrases.play("fallback_stt")
                     self._set_cooldown()
                 except Exception as e:
@@ -851,6 +929,7 @@ class Pipeline:
                 _llm_ms = (time.monotonic() - _llm_t0) * 1000.0
                 if response is None:
                     self.processing_busy.clear()
+                    self._play_earcon(self.error_earcon_pcm)
                     self._handle_server_error()
                     continue
                 self.history.append({"role": "assistant", "content": self._trim_for_memory(response)})
@@ -937,18 +1016,7 @@ class Pipeline:
                 # Interrupt produced a usable transcript — count as success.
                 self._m_interrupt_success += 1
 
-                # Earcon: tells the user their barge-in was registered.
-                def _play_earcon():
-                    _pa = pyaudio.PyAudio()
-                    _st = _pa.open(format=pyaudio.paInt16, channels=1,
-                                   rate=self.cfg.sample_rate, output=True)
-                    _st.write(self._interrupt_earcon_pcm.tobytes())
-                    _st.stop_stream()
-                    _st.close()
-                    _pa.terminate()
-                threading.Thread(target=_play_earcon, daemon=True).start()
-
-                                # Build combined transcript with context-aware joining.
+                # Build combined transcript with context-aware joining.
                 _STOP_RE       = re.compile(
                     r'^\s*(stop|cancel|nevermind|never mind|quit|shut up)\s*[.!?]?\s*$',
                     re.I)
@@ -962,6 +1030,7 @@ class Pipeline:
                     self.conversation_mode.clear()
                     self._last_tts_end_time = None
                     self.processing_busy.clear()
+                    self._play_earcon(self.sleep_earcon_pcm)
                     self.phrases.play("goodbye")
                     self._set_cooldown()
                     continue                        # ← back to top of while loop
