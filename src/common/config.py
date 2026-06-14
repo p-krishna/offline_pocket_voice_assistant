@@ -126,6 +126,7 @@ class Config:
     # --- Interrupt tuning ---
     interrupt_min_speech_ms: int = int(os.environ.get("INTERRUPT_MIN_SPEECH_MS", "300"))
     interrupt_energy_threshold: float = float(os.environ.get("INTERRUPT_ENERGY_THRESHOLD", "0.005"))
+    interrupt_hiss_filter: bool = os.environ.get("INTERRUPT_HISS_FILTER", "1") == "1"
 
     # --- Conversation timeout ---
     conversation_timeout_s: int = int(os.environ.get("CONVERSATION_TIMEOUT_S", "45"))

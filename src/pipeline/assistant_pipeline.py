@@ -132,6 +132,10 @@ class Pipeline:
             lambda: "__REPEAT__"),
         ]
 
+        # Pre-baked interrupt earcon: descending two-tone beep, ~180 ms.
+        self._interrupt_earcon_pcm = self._make_interrupt_earcon(
+            self.cfg.sample_rate)
+
     # ------------------------------------------------------------------
     # Startup validation helpers
     # ------------------------------------------------------------------
@@ -260,10 +264,40 @@ class Pipeline:
         combined = np.concatenate(frames).astype(np.float32) / 32768.0
         return float(np.sqrt(np.mean(combined ** 2)))
 
+    @staticmethod
+    def _is_breath_or_hiss(frames: list, sample_rate: int) -> bool:
+        """True if audio looks like a breath or hiss rather than voiced speech.
+        Uses spectral centroid > 4 kHz AND zero-crossing rate > 0.35.
+        Both must fire to reject — avoids dropping sibilant speech like 'stop'."""
+        if not frames:
+            return False
+        pcm = np.concatenate(frames).astype(np.float32) / 32768.0
+        if len(pcm) < 64:
+            return False
+        # Zero-crossing rate
+        zcr = float(np.mean(np.abs(np.diff(np.sign(pcm)))) / 2)
+        # Spectral centroid
+        fft_mag = np.abs(np.fft.rfft(pcm))
+        freqs = np.fft.rfftfreq(len(pcm), d=1.0 / sample_rate)
+        centroid = float(np.sum(freqs * fft_mag) / (np.sum(fft_mag) + 1e-9))
+        return centroid > 4000 and zcr > 0.35
+
     def _set_cooldown(self, seconds: float | None = None) -> None:
         """Ignore mic input for a short period after assistant/system audio."""
         self.cooldown_until = time.monotonic() + (seconds or self.cfg.assistant_audio_cooldown_s)
 
+    @staticmethod
+    def _make_interrupt_earcon(sample_rate: int) -> np.ndarray:
+        """880 Hz → 660 Hz descending two-tone, 180 ms, int16, ~40% volume."""
+        dur = int(sample_rate * 0.09)   # 90 ms per tone
+        t   = np.linspace(0, 0.09, dur, endpoint=False)
+        hi  = np.sin(2 * np.pi * 880 * t)
+        lo  = np.sin(2 * np.pi * 660 * t)
+        wave = np.concatenate([hi, lo])
+        fade = int(sample_rate * 0.005)
+        wave[:fade]  *= np.linspace(0, 1, fade)
+        wave[-fade:] *= np.linspace(1, 0, fade)
+        return (wave * 13000).astype(np.int16)   # 40% of 32767
     # ------------------------------------------------------------------
     # Thread 1: Audio
     # ------------------------------------------------------------------
@@ -415,7 +449,10 @@ class Pipeline:
                     #   2. RMS energy above threshold (filters hiss/breath noise)
                     if interrupt_speech_ms >= self.cfg.interrupt_min_speech_ms:
                         rms = self._rms(interrupt_recording)
-                        if rms >= self.cfg.interrupt_energy_threshold and not interrupt_active:
+                        if rms >= self.cfg.interrupt_energy_threshold and not interrupt_active \
+                                and not (self.cfg.interrupt_hiss_filter \
+                                    and self._is_breath_or_hiss(list(interrupt_recording), self.cfg.sample_rate) \
+                                ):
                             interrupt_active = True
                             print(f"[{stamp()}] Interrupt detected (rms={rms:.4f})")
                             try:
@@ -706,15 +743,25 @@ class Pipeline:
 
                     chunk_size = 1024
                     offset = 0
+                    _FADE_CHUNKS = 4   # ~100 ms of fade at 1024 frames/16 kHz
+                    _fade_count  = 0
 
                     while offset < len(pcm):
-                        if self.cancel_event.is_set():
-                            print(f"[{stamp()}] TTS cut mid-sentence")
-                            stream.stop_stream()
-                            return False
+                        end   = min(offset + chunk_size, len(pcm))
+                        chunk = pcm[offset:end].copy()
 
-                        end = min(offset + chunk_size, len(pcm))
-                        chunk = pcm[offset:end]
+                        if self.cancel_event.is_set():
+                            if _fade_count >= _FADE_CHUNKS:
+                                stream.stop_stream()
+                                print(f"[{stamp()}] TTS faded out mid-sentence")
+                                return False
+                            # Linear fade-out so the cut isn't a hard click.
+                            fade = np.linspace(1.0, 0.0, len(chunk),
+                                               dtype=np.float32)
+                            chunk = (chunk.astype(np.float32) * fade
+                                     ).astype(np.int16)
+                            _fade_count += 1
+
                         stream.write(chunk.tobytes())
                         offset = end
 
@@ -890,10 +937,46 @@ class Pipeline:
                 # Interrupt produced a usable transcript — count as success.
                 self._m_interrupt_success += 1
 
-                # Build combined transcript: original + spoken correction.
-                # "Actually, ..." is a strong correction signal for small LLMs.
-                combined = f"{transcript}. Actually, {interrupt_transcript}"
-                print(f"[{stamp()}] Combined transcript: {combined}")
+                # Earcon: tells the user their barge-in was registered.
+                def _play_earcon():
+                    _pa = pyaudio.PyAudio()
+                    _st = _pa.open(format=pyaudio.paInt16, channels=1,
+                                   rate=self.cfg.sample_rate, output=True)
+                    _st.write(self._interrupt_earcon_pcm.tobytes())
+                    _st.stop_stream()
+                    _st.close()
+                    _pa.terminate()
+                threading.Thread(target=_play_earcon, daemon=True).start()
+
+                                # Build combined transcript with context-aware joining.
+                _STOP_RE       = re.compile(
+                    r'^\s*(stop|cancel|nevermind|never mind|quit|shut up)\s*[.!?]?\s*$',
+                    re.I)
+                _CORRECTION_RE = re.compile(
+                    r'\b(actually|no\b|wait|that\'?s wrong|incorrect|never mind)\b',
+                    re.I)
+
+                if _STOP_RE.match(interrupt_transcript):
+                    # Pure stop: clear conversation, don't call LLM.
+                    print(f"[{stamp()}] Interrupt is STOP command — clearing conversation")
+                    self.conversation_mode.clear()
+                    self._last_tts_end_time = None
+                    self.processing_busy.clear()
+                    self.phrases.play("goodbye")
+                    self._set_cooldown()
+                    continue                        # ← back to top of while loop
+
+                elif _CORRECTION_RE.search(interrupt_transcript):
+                    # Correction: give LLM explicit signal, keep prior context.
+                    combined = (f"{transcript.rstrip('.')}. "
+                                f"[Correction] {interrupt_transcript}")
+                else:
+                    # New topic mid-answer: just use interrupt as the new query.
+                    combined = interrupt_transcript
+
+                print(f"""[{stamp()}] Combined transcript ({
+                      'correction' if _CORRECTION_RE.search(interrupt_transcript) else 'new'
+                      }): {combined!r}""")
 
                 # Update history: replace the last user entry with combined.
                 # Pop assistant turn (last) and user turn (second to last),
