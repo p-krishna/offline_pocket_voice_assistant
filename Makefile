@@ -92,3 +92,17 @@ kill-servers:
 	-@pkill -f whisper-server && echo "STT server killed."  || echo "STT server not running."
 	-@pkill -f serve_kokoro   && echo "TTS server killed."  || echo "TTS server not running."
 	@echo "Done."
+
+## Replay a saved WAV through STT only
+## Usage: make replay-stt WAV=debug_audio/utterance_1234.wav
+replay-stt:
+	python src/tools/replay_stt.py $(WAV)
+
+## Replay a saved WAV through STT + LLM
+## Usage: make replay-pipeline WAV=debug_audio/utterance_1234.wav
+replay-pipeline:
+	python src/tools/replay_pipeline.py --llm $(WAV)
+
+## Create the 5 named reference test clips
+create-test-clips:
+	python src/tools/create_test_clips.py

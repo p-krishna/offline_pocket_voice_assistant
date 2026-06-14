@@ -16,8 +16,9 @@ class WhisperCppSTT:
         self.timeout  = cfg.http_timeout
 
     def transcribe(self, samples, sample_rate):
-        if not samples:
-            return ""
+        # Guard works for both lists-of-frames and flat numpy arrays
+        if samples is None or (hasattr(samples, '__len__') and len(samples) == 0):
+            return
 
         # Write samples to a temp WAV file — whisper-server needs a real file.
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -28,7 +29,13 @@ class WhisperCppSTT:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(sample_rate)
-                wf.writeframes(np.concatenate(samples).astype(np.int16).tobytes())
+                # Normalize: accept either a flat numpy array or a list of frame arrays.
+                # The pipeline passes a list-of-frames; replay tools pass a single flat array.
+                if isinstance(samples, np.ndarray):
+                    flat = samples.astype(np.int16)
+                else:
+                    flat = np.concatenate(samples).astype(np.int16)
+                wf.writeframes(flat.tobytes())
 
             # Send WAV as multipart form to the persistent whisper-server.
             with open(tmp_path, "rb") as f:
