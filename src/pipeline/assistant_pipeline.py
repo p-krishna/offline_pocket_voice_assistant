@@ -42,7 +42,9 @@ from vad.webrtc import WebRTCGate
 from wakeword.listen import WakeWordListener
 
 # Whisper tokens that mean "nothing was said" — never send these to the LLM.
-BLANK_TOKENS = {"[BLANK_AUDIO]", "[SILENCE]", "[MUSIC]", "(silence)", "(ambient noise)", "(birds chirping)", "(chuckles)", "(speaking in foreign language)"}
+BLANK_TOKENS = {"[BLANK_AUDIO]", "[SILENCE]", "[MUSIC]", "(silence)", "(ambient noise)",
+                "(birds chirping)", "(chuckles)", "(speaking in foreign language)",
+                "(upbeat music)", "(crowd chattering)", "(humming)"}
 
 
 class Pipeline:
@@ -509,7 +511,7 @@ class Pipeline:
                         # Speech must be sustained, not sporadic.
                         # Reset the interrupt speech duration and recording
                         interrupt_speech_ms = 0.0
-                        interrupt_recording = []
+                        # interrupt_recording = []
 
                     # Fire interrupt only if:
                     #   1. Sustained speech for interrupt_min_speech_ms
@@ -995,6 +997,7 @@ class Pipeline:
                 # but clear interrupt_queue of any double-fire just in case.)
                 try:
                     interrupt_samples = self.interrupt_queue.get_nowait()
+                    print(f"[{stamp()}] Interrupt audio dequeued ({len(interrupt_samples) / self.webrtc.sample_rate:.2f} seconds)")
                 except queue.Empty:
                     # Interrupt signal arrived but no audio — treat as fresh
                     # listen cycle.

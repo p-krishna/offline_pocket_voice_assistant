@@ -54,7 +54,7 @@ class Config:
     # Higher = harder to accidentally re-trigger after TTS. Tune with noisy env logs.
 
     # Seconds to ignore mic after any assistant/system audio.
-    assistant_audio_cooldown_s: float = float(os.getenv("ASSISTANT_AUDIO_COOLDOWN_S", "2.0"))
+    assistant_audio_cooldown_s: float = float(os.getenv("ASSISTANT_AUDIO_COOLDOWN_S", "0.0"))
     # Seconds to ignore mic after any assistant/system audio.
     # 2.0s gives speaker hardware time to drain + avoids self-hearing TTS tail.
 
