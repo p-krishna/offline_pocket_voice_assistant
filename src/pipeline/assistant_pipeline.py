@@ -288,6 +288,55 @@ class Pipeline:
         with open(log_path, "a") as f:
             f.write(json.dumps(turn_data) + "\n")
 
+    def _viz_log(
+        self,
+        msg: str,
+        *,
+        # These are optional — only passed from _audio_thread where values exist
+        rms: float | None = None,
+        silero_prob: float | None = None,
+        webrtc_state: str | None = None,
+        phase: str | None = None,
+        elapsed_ms: float | None = None,
+    ) -> None:
+        """
+        Print msg unconditionally (preserves all existing log output).
+        When debug_mode is on, also print a structured ASCII viz line
+        BEFORE the message so the event is clearly anchored to live stats.
+        Thread-safe: print() holds the GIL per call, so lines don't interleave.
+        """
+        if self.cfg.debug_mode and any(
+            v is not None for v in (rms, silero_prob, webrtc_state, phase, elapsed_ms)
+        ):
+            # --- RMS bar (20 chars wide, scaled 0→0.05 for voice range) ---
+            bar_max = 0.05          # RMS above 0.05 is very loud speech
+            rms_val = rms or 0.0
+            filled = int(min(rms_val / bar_max, 1.0) * 20)
+            rms_bar = "█" * filled + "░" * (20 - filled)
+
+            # --- Silero bar (10 chars, 0→1 probability) ---
+            sil_val = silero_prob or 0.0
+            sil_filled = int(min(sil_val, 1.0) * 10)
+            sil_bar = "▓" * sil_filled + "·" * (10 - sil_filled)
+
+            # --- Compose the viz prefix line ---
+            parts = []
+            if elapsed_ms is not None:
+                parts.append(f"T+{elapsed_ms:6.0f}ms")
+            if rms is not None:
+                parts.append(f"RMS[{rms_bar}]{rms_val:.4f}")
+            if webrtc_state is not None:
+                tag = "SPK" if webrtc_state == "speech" else "SIL"
+                parts.append(f"WebRTC:{tag}")
+            if silero_prob is not None:
+                parts.append(f"Silero[{sil_bar}]{sil_val:.2f}")
+            if phase is not None:
+                parts.append(f"Phase:{phase}")
+
+            print("  VIZ | " + " | ".join(parts))
+
+        print(msg)
+
     # ── RMS energy helper ─────────────────────────────────────────────────────
 
     @staticmethod
@@ -523,10 +572,18 @@ class Pipeline:
                                     and self._is_breath_or_hiss(list(interrupt_recording), self.cfg.sample_rate) \
                                 ):
                             interrupt_active = True
-                            print(f"[{stamp()}] Interrupt detected (rms={rms:.4f})")
+                            self._viz_log(
+                                f"[{stamp()}] Interrupt detected (rms={rms:.4f})",
+                                rms=rms,
+                                phase="INTERRUPT",
+                            )
                             try:
                                 self.interrupt_queue.put_nowait(list(interrupt_recording))
-                                print(f"[{stamp()}] Interrupt audio enqueued ({len(interrupt_recording) / self.webrtc.sample_rate:.2f}) seconds)")
+                                self._viz_log(
+                                    f"[{stamp()}] Interrupt audio enqueued ({len(interrupt_recording) / self.webrtc.sample_rate:.2f}) seconds)",
+                                    rms=rms,
+                                    phase="INTERRUPT",
+                                )
                             except queue.Full:
                                 pass
                             # Count detection here (T1 side — single writer for this counter).
@@ -550,12 +607,18 @@ class Pipeline:
                 if self.webrtc.state is None:
                     self.webrtc.state = new_webrtc_state
                     self.webrtc.started_at = t
-                    print(f"[{stamp()}] WebRTC {new_webrtc_state} (start)")
+                    self._viz_log(
+                        f"[{stamp()}] WebRTC {new_webrtc_state} (start)",
+                        webrtc_state=new_webrtc_state,
+                        phase="PRE-WAKE",
+                    )
                 elif new_webrtc_state != self.webrtc.state:
                     old = self.webrtc.state
-                    print(
+                    self._viz_log(
                         f"[{stamp()}] WebRTC {old} -> {new_webrtc_state} "
-                        f"after {t - self.webrtc.started_at:.2f}s"
+                        f"after {t - self.webrtc.started_at:.2f}s",
+                        webrtc_state=new_webrtc_state,
+                        phase="PRE-WAKE",
                     )
                     self.webrtc.state = new_webrtc_state
                     self.webrtc.started_at = t
@@ -580,7 +643,11 @@ class Pipeline:
                     post_roll_queue = deque(maxlen=post_roll_frames)
                     self.conversation_mode.set()
                     warning_played = False
-                    print(f"[{stamp()}] WakeWord detected: {self.cfg.wakeword} score={score:.3f}")
+                    self._viz_log(
+                        f"[{stamp()}] WakeWord detected: {self.cfg.wakeword} score={score:.3f}",
+                        rms=self._rms([frame]),
+                        phase="WAKE",
+                    )
                     threading.Thread(
                         target=lambda: (
                             self._play_earcon(self.wake_earcon_pcm),
@@ -636,12 +703,25 @@ class Pipeline:
                 changed, new_state, old_state, avg, started, t2 = self.silero.update(prob)
 
                 if changed:
+                    elapsed = (t - command_start) * 1000 if command_start else 0.0
                     if old_state is None:
-                        print(f"[{stamp()}] Silero {new_state} (start) avg={avg:.3f}")
+                        self._viz_log(
+                            f"[{stamp()}] Silero {new_state} (start) avg={avg:.3f}",
+                            rms=self._rms([recording[-1]]) if recording else None,
+                            silero_prob=prob,
+                            webrtc_state=self.webrtc.state,
+                            phase="LISTENING",
+                            elapsed_ms=elapsed,
+                        )
                     else:
-                        print(
+                        self._viz_log(
                             f"[{stamp()}] Silero {old_state} -> {new_state} "
-                            f"after {t2 - started:.2f}s avg={avg:.3f}"
+                            f"after {t2 - started:.2f}s avg={avg:.3f}",
+                            rms=self._rms([recording[-1]]) if recording else None,
+                            silero_prob=prob,
+                            webrtc_state=self.webrtc.state,
+                            phase="LISTENING",
+                            elapsed_ms=elapsed,
                         )
 
                 silence_frames = (
@@ -665,9 +745,21 @@ class Pipeline:
 
                 if (enough_time and enough_silence) or early_exit:
                     if early_exit and not enough_time:
-                        print(f"[{stamp()}] Early exit at {command_age_ms:.0f}ms (avg={avg:.3f})")
+                        self._viz_log(
+                            f"[{stamp()}] Early exit at {command_age_ms:.0f}ms (avg={avg:.3f})",
+                            rms=self._rms(recording) if recording else None,
+                            silero_prob=avg,
+                            phase="LISTENING",
+                            elapsed_ms=command_age_ms,
+                        )
                     else:
-                        print(f"[{stamp()}] Utterance ended")
+                        self._viz_log(
+                            f"[{stamp()}] Utterance ended",
+                            rms=self._rms(recording) if recording else None,
+                            silero_prob=avg,
+                            phase="LISTENING",
+                            elapsed_ms=command_age_ms,
+                        )
 
                     samples = recording + list(post_roll_queue)
                     self.save_debug_wav(samples)
@@ -676,9 +768,13 @@ class Pipeline:
                     # Drop them quietly instead of saying "please wait".
                     capture_rms = self._rms(samples)
                     if command_age_ms < self.cfg.utterance_reject_ms or capture_rms < self.cfg.utterance_reject_rms:
-                        print(
+                        self._viz_log(
                             f"[{stamp()}] REJECTED Utterance"
-                            f"(age={command_age_ms:.0f}ms rms={capture_rms:.4f})"
+                            f"(age={command_age_ms:.0f}ms rms={capture_rms:.4f})",
+                            rms=capture_rms,
+                            silero_prob=avg,
+                            phase="LISTENING",
+                            elapsed_ms=command_age_ms,
                         )
                         # A wake fired but the capture was too short/quiet — count as false wake.
                         self._m_false_wakes += 1
@@ -694,9 +790,13 @@ class Pipeline:
                         reset_utterance_state()
                         break
                     else:
-                        print(
+                        self._viz_log(
                             f"[{stamp()}] ACCEPTED Utterance"
-                            f"(age={command_age_ms:.0f}ms rms={capture_rms:.4f})"
+                            f"(age={command_age_ms:.0f}ms rms={capture_rms:.4f})",
+                            rms=capture_rms,
+                            silero_prob=avg,
+                            phase="LISTENING",
+                            elapsed_ms=command_age_ms,
                         )
 
                     try:
