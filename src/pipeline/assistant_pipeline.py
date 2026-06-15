@@ -584,11 +584,13 @@ class Pipeline:
                             # the Silero silence-gate, just like after a wake word.
                             self._m_interrupt_detected += 1
                             self.cancel_event.set()
-                            self._set_cooldown()
-                            reset_interrupt_state()
+                            # Capture interrupt_recording NOW before reset clears it.
+                            # This is the audio T1 has been accumulating during TTS —
+                            # it contains the user's first words ("one, two...").
+                            captured_so_far = list(interrupt_recording)
+                            reset_interrupt_state()            # clears interrupt_recording
 
-                            # Re-enter post-wake listening mode so the full
-                            # utterance is captured naturally.
+                            # Re-enter post-wake listening mode
                             after_wake = True
                             current_capture_from_conversation = True
                             command_start = t
@@ -597,10 +599,15 @@ class Pipeline:
                             self.silero.state = None
                             self.silero.started_at = None
                             self.silero.history = []
-                            recording = list(pre_roll)         # keep pre-roll so first words aren't clipped
+                            # Seed with captured interrupt audio, NOT stale pre_roll.
+                            recording = captured_so_far
                             post_roll_queue = deque(maxlen=post_roll_frames)
                             warning_played = False
-                            self._play_earcon(self.listening_earcon_pcm)  # audible cue: now listening
+                            # Play earcon in background — don't block T1.
+                            threading.Thread(
+                                target=lambda: self._play_earcon(self.listening_earcon_pcm),
+                                daemon=True
+                            ).start()
                         elif rms < self.cfg.interrupt_energy_threshold:
                             reset_interrupt_state()
 
