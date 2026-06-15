@@ -573,24 +573,34 @@ class Pipeline:
                                 ):
                             interrupt_active = True
                             self._viz_log(
-                                f"[{stamp()}] Interrupt detected (rms={rms:.4f})",
+                                f"[{stamp()}] Interrupt detected (rms={rms:.4f}) — switching to listen mode",
                                 rms=rms,
                                 phase="INTERRUPT",
                             )
-                            try:
-                                self.interrupt_queue.put_nowait(list(interrupt_recording))
-                                self._viz_log(
-                                    f"[{stamp()}] Interrupt audio enqueued ({len(interrupt_recording) / self.webrtc.sample_rate:.2f}) seconds)",
-                                    rms=rms,
-                                    phase="INTERRUPT",
-                                )
-                            except queue.Full:
-                                pass
-                            # Count detection here (T1 side — single writer for this counter).
+                            # Signal T2 to stop TTS (cancel_event), but do NOT
+                            # put the short interrupt_recording into the queue.
+                            # Instead, drop back into the normal post-wake capture
+                            # path so the user's full utterance is recorded via
+                            # the Silero silence-gate, just like after a wake word.
                             self._m_interrupt_detected += 1
                             self.cancel_event.set()
                             self._set_cooldown()
                             reset_interrupt_state()
+
+                            # Re-enter post-wake listening mode so the full
+                            # utterance is captured naturally.
+                            after_wake = True
+                            current_capture_from_conversation = True
+                            command_start = t
+                            silero_buf = np.zeros(0, dtype=np.int16)
+                            silence_frames = 0
+                            self.silero.state = None
+                            self.silero.started_at = None
+                            self.silero.history = []
+                            recording = list(pre_roll)         # keep pre-roll so first words aren't clipped
+                            post_roll_queue = deque(maxlen=post_roll_frames)
+                            warning_played = False
+                            self._play_earcon(self.listening_earcon_pcm)  # audible cue: now listening
                         elif rms < self.cfg.interrupt_energy_threshold:
                             reset_interrupt_state()
 
