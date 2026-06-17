@@ -7,6 +7,7 @@ from silero_vad import load_silero_vad
 
 from common import now
 from common.config import load_config
+from common.event_logger import logger
 
 torch.set_num_threads(1)
 cfg = load_config()
@@ -52,10 +53,12 @@ class SileroGate:
         if self.state is None:
             self.state = new_state
             self.started_at = t
+            logger.silero(new_state == 'speech', avg=avg)
             return True, new_state, None, avg, self.started_at, t
         if changed:
             started = self.started_at
             self.state = new_state
             self.started_at = t
+            logger.silero(new_state == 'speech', avg=avg)
             return True, new_state, old, avg, started, t
         return False, new_state, old, avg, self.started_at, t
