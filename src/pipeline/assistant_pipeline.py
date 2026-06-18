@@ -29,6 +29,7 @@ from wave import open as wave_open
 
 import pyaudio
 import soundfile as sf
+import sounddevice as sd
 
 from common import stamp, _LatencyTracer
 from common.config import load_config
@@ -407,11 +408,8 @@ class Pipeline:
     def _play_earcon(self, pcm: np.ndarray) -> None:
         """Play a pre-baked earcon PCM array in a daemon thread (non-blocking)."""
         def _play():
-            pa = pyaudio.PyAudio()
-            st = pa.open(format=pyaudio.paInt16, channels=1,
-                        rate=self.cfg.sample_rate, output=True)
-            st.write(pcm.tobytes())
-            st.stop_stream(); st.close(); pa.terminate()
+            # use sounddevice to play the earcon in a non-blocking way
+            sd.play(pcm, samplerate=self.cfg.sample_rate, blocking=False)
         threading.Thread(target=_play, daemon=True).start()
 
 
@@ -861,7 +859,8 @@ class Pipeline:
 
             print(f"[{stamp()}] Transcript: {transcript}")
 
-            if not transcript or not transcript.strip() or transcript.strip() in BLANK_TOKENS:
+            if (not transcript) or (not transcript.strip()) or (transcript.strip() in BLANK_TOKENS) \
+                or (len(transcript.strip()) < 2):
                 return None
 
             return transcript.strip()        
