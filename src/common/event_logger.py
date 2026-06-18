@@ -39,7 +39,7 @@ class EventLogger:
     def log(self, kind: str, value: float = None, label: str = None):
         entry = {"ts": int(time.time() * 1000), "kind": kind}
         if value is not None:
-            entry["value"] = str(round(value, 5))
+            entry["value"] = float(round(value, 5))
         if label is not None:
             entry["label"] = label[:200]
         with self._lock:

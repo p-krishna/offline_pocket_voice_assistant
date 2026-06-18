@@ -126,6 +126,7 @@ async function fetchLog() {
     redraw();
   } catch (e) {
     document.getElementById("status").textContent = `Cannot reach ${LOG_URL} — run: python3 -m http.server 9999 --directory /tmp`;
+    console.error(e);
   }
 }
 
