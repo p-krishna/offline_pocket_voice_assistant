@@ -67,18 +67,23 @@ kokoro-server  :8082 ──── WAV bytes ──── save + play
 
 | File | Location | What it does |
 |---|---|---|
-| `config.py` | `src/common/` | Single source of truth for all runtime settings |
-| `webrtc.py` | `src/vad/` | Continuous silence gate using WebRTC VAD |
-| `silero.py` | `src/vad/` | Post-wake utterance end detection using Silero VAD |
-| `listen.py` | `src/wakeword/` | Wake word detection using openWakeWord |
-| `whisper_cpp.py` | `src/stt/` | STT client — sends WAV to whisper-server, returns transcript |
-| `serve_whisper.sh` | `src/stt/` | Starts `whisper-server` on port 8081 |
-| `gemma.py` | `src/llm/` | LLM client — sends transcript to llama-server, returns response |
-| `serve_gemma.sh` | `src/llm/` | Starts `llama-server` on port 8080 |
-| `kokoro.py` | `src/tts/` | TTS client — sends text to kokoro-server, saves WAV and plays it |
-| `serve_kokoro.py` | `src/tts/` | Python HTTP server that runs Kokoro TTS on port 8082 |
-| `assistant_pipeline.py` | `src/pipeline/` | Main orchestrator — connects all six stages |
-| `Makefile` | project root | Short commands for install, server launch, unit checks, and full run |
+| `config.py` | `src/common/` | Single source of truth for runtime settings. Run example: `PYTHONPATH=src python -c "from common.config import Config; print(Config())"` |
+| `servers.py` | `src/common/` | Server watchdog / launcher used by `make watch-servers`. Run: `make watch-servers` or `PYTHONPATH=src python src/common/servers.py` |
+| `event_logger.py` | `src/common/` | Lightweight event logging helpers (imported). No standalone run; used by other modules. |
+| `webrtc.py` | `src/vad/` | Continuous silence gate using WebRTC VAD. Run example: `PYTHONPATH=src python src/vad/webrtc.py` |
+| `silero.py` | `src/vad/` | Post-wake utterance end detection using Silero VAD. Run example: `PYTHONPATH=src python src/vad/silero.py` |
+| `listen.py` | `src/wakeword/` | Wake word detection using openWakeWord. Run: `PYTHONPATH=src python src/wakeword/listen.py` or `make check-wakeword` |
+| `whisper_cpp.py` | `src/stt/` | STT client — sends WAV to whisper-server, returns transcript. Run: `PYTHONPATH=src python src/stt/whisper_cpp.py src/stt/stt_test_sample.wav` |
+| `serve_whisper.sh` | `src/stt/` | Starts `whisper-server` on port 8081. Run: `/bin/bash src/stt/serve_whisper.sh` or `make serve-stt` |
+| `gemma.py` | `src/llm/` | LLM client — sends transcript to llama-server, returns response. Run: `PYTHONPATH=src python src/llm/gemma.py` or `make check-llm` |
+| `serve_gemma.sh` | `src/llm/` | Starts `llama-server` on port 8080. Run: `/bin/bash src/llm/serve_gemma.sh` or `make serve-llm` |
+| `kokoro.py` | `src/tts/` | TTS client — sends text to kokoro-server, saves WAV and plays it. Run: `PYTHONPATH=src python src/tts/kokoro.py` or `make check-tts` |
+| `serve_kokoro.py` | `src/tts/` | Python HTTP server that runs Kokoro TTS on port 8082. Run: `PYTHONPATH=src python src/tts/serve_kokoro.py` or `make serve-tts` |
+| `phrases.py` | `src/tts/` | Predefined TTS phrases used by the assistant (imported by `kokoro.py`). No standalone run. |
+| `earcon.py` | `src/tts/` | Short earcon sounds and helpers (imported). No standalone run. |
+| `assistant_pipeline.py` | `src/pipeline/` | Main orchestrator — connects all stages. Run: `PYTHONPATH=src python src/pipeline/assistant_pipeline.py` or `make run-pipeline` |
+| `tools/*` | `src/tools/` | Utility scripts. Examples: `PYTHONPATH=src python src/tools/replay_stt.py WAV=path`, `PYTHONPATH=src python src/tools/replay_pipeline.py --llm WAV`, `PYTHONPATH=src python src/tools/create_test_clips.py` |
+| `Makefile` | project root | Short commands for install, server launch, unit checks, and full run (use `make <target>`) |
 
 ---
 
@@ -87,23 +92,24 @@ kokoro-server  :8082 ──── WAV bytes ──── save + play
 ```text
 LICENSE
 Makefile
+.gitignore
 README.md
 configs/
+    environment.yml
     requirements.txt
-    wakeword/
-        requirements.txt
-        environment.yml
-        versions.lock.json
+    versions.lock.json
 docs/
-    setup/
-        wakeword.md
+    roadmap.md
 src/
+    __init__.py
     common/
         __init__.py
         config.py
+        servers.py
+        event_logger.py
     vad/
-        webrtc.py
         silero.py
+        webrtc.py
     wakeword/
         listen.py
     stt/
@@ -111,13 +117,22 @@ src/
         serve_whisper.sh
         stt_test_sample.wav
     llm/
+        __init__.py
         gemma.py
         serve_gemma.sh
     tts/
         kokoro.py
         serve_kokoro.py
+        phrases.py
+        earcon.py
     pipeline/
         assistant_pipeline.py
+    tools/
+        create_test_clips.py
+        replay_pipeline.py
+        replay_stt.py
+        cors_server.py
+        visualize_events.html
 ```
 
 ---
@@ -206,15 +221,22 @@ stateDiagram-v2
 |---|---|
 | `make install-system` | Installs `libspeexdsp-dev`, `swig`, `portaudio19-dev` via apt |
 | `make install-python-deps` | Installs all Python packages from `configs/requirements.txt` |
-| `make serve-llm` | Starts llama-server on port 8080 |
-| `make serve-stt` | Starts whisper-server on port 8081 |
-| `make serve-tts` | Starts kokoro Python server on port 8082 |
-| `make run-pipeline` | Auto-starts all three servers if needed, then runs the full pipeline |
-| `make list-devices` | Lists available audio input devices |
+| `make serve-llm` | Starts `src/llm/serve_gemma.sh` (llama-server) |
+| `make serve-stt` | Starts `src/stt/serve_whisper.sh` (whisper-server) |
+| `make serve-tts` | Runs `src/tts/serve_kokoro.py` (Kokoro TTS server) |
+| `make serve-all` | Starts all three servers in the background |
+| `make watch-servers` | Runs `src/common/servers.py` to restart servers if they die |
+| `make check-servers` | Quick nc probes for ports 8080/8081/8082 |
+| `make list-devices` | Lists available audio input devices via `src/wakeword/listen.py` |
 | `make check-wakeword` | Runs the wake word listener in isolation |
-| `make check-stt` | Tests STT with a local WAV file (`stt_test_sample.wav`) |
-| `make check-llm` | Tests LLM by sending a fixed prompt to the running server |
-| `make check-tts` | Tests TTS by synthesizing and playing a short sentence |
+| `make check-stt` | Tests STT with a local WAV file (`src/stt/stt_test_sample.wav`) |
+| `make check-llm` | Tests LLM client (`src/llm/gemma.py`) against running server |
+| `make check-tts` | Tests TTS client (`src/tts/kokoro.py`) against running server |
+| `make run-pipeline` | Auto-starts any missing servers and runs `src/pipeline/assistant_pipeline.py` |
+| `make kill-servers` | Kills any running server processes (`llama-server`, `whisper-server`, `serve_kokoro`) |
+| `make replay-stt WAV=path` | Replay a WAV through STT only (`src/tools/replay_stt.py`) |
+| `make replay-pipeline WAV=path` | Replay a WAV through STT + LLM (`src/tools/replay_pipeline.py`) |
+| `make create-test-clips` | Create reference test WAVs (`src/tools/create_test_clips.py`) |
 
 ---
 

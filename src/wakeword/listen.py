@@ -7,6 +7,7 @@ from openwakeword.model import Model
 
 from common import now
 from common.config import load_config
+from common.event_logger import logger
 
 
 cfg = load_config()
@@ -54,6 +55,7 @@ class WakeWordListener:
                 pcm = stream.read(self.chunk_size, exception_on_overflow=False)
                 frame = np.frombuffer(pcm, dtype=np.int16)
                 score = self.model.predict(frame).get(self.wakeword, 0.0)
+                logger.wakeword(score)
                 if on_score:
                     on_score(score)
                 if score >= self.threshold:

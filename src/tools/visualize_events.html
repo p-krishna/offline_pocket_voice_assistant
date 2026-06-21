@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Assistant Event Visualizer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f1117; color: #cdd6f4; font-family: 'Courier New', monospace; font-size: 13px; }
+  header { padding: 12px 20px; background: #1e1e2e; border-bottom: 1px solid #313244; display: flex; align-items: center; gap: 16px; }
+  h1 { font-size: 15px; color: #cba6f7; }
+  #status { font-size: 12px; color: #6c7086; }
+  #status.live { color: #a6e3a1; }
+  button { background: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+  button:hover { background: #45475a; }
+
+  #legend { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 20px; background: #181825; border-bottom: 1px solid #313244; }
+  .leg { display: flex; align-items: center; gap: 4px; font-size: 11px; }
+  .leg-dot { width: 10px; height: 10px; border-radius: 2px; }
+
+  #canvas-wrap { position: relative; overflow-x: auto; padding: 12px 20px; }
+  canvas { display: block; }
+
+  #tooltip {
+    position: fixed; background: #1e1e2e; border: 1px solid #45475a;
+    padding: 6px 10px; border-radius: 6px; font-size: 11px; pointer-events: none;
+    display: none; z-index: 10; max-width: 320px; line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🎙 Pipeline Event Visualizer</h1>
+  <span id="status">waiting…</span>
+  <button onclick="clearLog()">Clear</button>
+  <label style="font-size:12px; display:flex; align-items:center; gap:6px;">
+    Window
+    <select id="windowSel" onchange="redraw()" style="background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4px;padding:2px;">
+      <option value="30">30s</option>
+      <option value="60" selected>60s</option>
+      <option value="120">2m</option>
+      <option value="300">5m</option>
+      <option value="0">All</option>
+    </select>
+  </label>
+</header>
+
+<div id="legend"></div>
+<div id="canvas-wrap"><canvas id="cv"></canvas></div>
+<div id="tooltip"></div>
+
+<script>
+// ── Config ──────────────────────────────────────────────────────────────────
+// Point this at your log file served via a simple HTTP server.
+// Run: python3 -m http.server 9999 --directory /tmp
+// Then open this HTML file and it reads assistant_events.jsonl from localhost:9999
+const LOG_URL = "http://localhost:9999/assistant_events.jsonl";
+const POLL_MS = 500;   // how often to re-read the log file
+
+// ── Lane definitions ────────────────────────────────────────────────────────
+// Each lane is a horizontal row. Events with matching kinds are drawn there.
+const LANES = [
+  { id: "amplitude",  label: "Amplitude (RMS)",  color: "#89b4fa", kinds: ["amplitude"],          type: "wave"  },
+  { id: "webrtc",     label: "WebRTC VAD",        color: "#a6e3a1", kinds: ["webrtc_speech","webrtc_silence"],  type: "state" },
+  { id: "wakeword",   label: "Wake Word",         color: "#cba6f7", kinds: ["wakeword"],           type: "spike" },
+  { id: "silero",     label: "Silero VAD",        color: "#f9e2af", kinds: ["silero_speech","silero_silence"],  type: "state" },
+  { id: "utterance",  label: "Utterance",         color: "#94e2d5", kinds: ["utterance_accepted","utterance_rejected"], type: "event" },
+  { id: "interrupt",  label: "Interrupt",         color: "#fab387", kinds: ["interrupt"],          type: "event" },
+  { id: "stt",        label: "STT",               color: "#74c7ec", kinds: ["stt_start","stt_result"],          type: "span"  },
+  { id: "llm",        label: "LLM",               color: "#f38ba8", kinds: ["llm_start","llm_result"],          type: "span"  },
+  { id: "tts",        label: "TTS",               color: "#eba0ac", kinds: ["tts_start","tts_end"],             type: "span"  },
+  { id: "error",      label: "Error",             color: "#f38ba8", kinds: ["error"],              type: "event" },
+];
+
+const KIND_LANE = {};
+LANES.forEach(l => l.kinds.forEach(k => KIND_LANE[k] = l));
+
+// ── State ───────────────────────────────────────────────────────────────────
+let events = [];    // all parsed events [{ts, kind, value, label}]
+let lastLen = 0;    // byte length last seen — used for incremental fetch
+
+// ── Legend ──────────────────────────────────────────────────────────────────
+const legEl = document.getElementById("legend");
+LANES.forEach(l => {
+  legEl.innerHTML += `<span class="leg"><span class="leg-dot" style="background:${l.color}"></span>${l.label}</span>`;
+});
+
+// ── Layout constants ────────────────────────────────────────────────────────
+const LANE_H   = 44;   // px per lane
+const LABEL_W  = 130;  // px for lane labels on the left
+const PAD_TOP  = 8;
+const PAD_BOT  = 24;
+
+// ── Canvas setup ────────────────────────────────────────────────────────────
+const cv  = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+
+function canvasHeight() { return PAD_TOP + LANES.length * LANE_H + PAD_BOT; }
+
+// ── Fetch + parse ────────────────────────────────────────────────────────────
+async function fetchLog() {
+  try {
+    // Use Range header to only fetch new bytes — fast incremental update
+    const headers = lastLen > 0 ? { Range: `bytes=${lastLen}-` } : {};
+    const res = await fetch(LOG_URL, { headers, cache: "no-store" });
+    if (res.status === 416) return;  // no new data
+    if (!res.ok) { document.getElementById("status").textContent = `HTTP ${res.status}`; return; }
+
+    const text = await res.text();
+    if (!text.trim()) return;
+
+    // Update byte counter for next incremental fetch
+    const cl = res.headers.get("Content-Length");
+    if (cl) lastLen += parseInt(cl);
+    else lastLen += new TextEncoder().encode(text).length;
+
+    // Parse new JSONL lines
+    const newEvts = text.trim().split("\n").flatMap(line => {
+      try { return [JSON.parse(line)]; } catch { return []; }
+    });
+    events.push(...newEvts);
+
+    const statusEl = document.getElementById("status");
+    statusEl.textContent = `${events.length} events | last: ${newEvts[newEvts.length-1]?.kind ?? "—"}`;
+    statusEl.className = "live";
+    redraw();
+  } catch (e) {
+    document.getElementById("status").textContent = `Cannot reach ${LOG_URL} — run: python3 -m http.server 9999 --directory /tmp`;
+    console.error(e);
+  }
+}
+
+function clearLog() {
+  events = []; lastLen = 0;
+  document.getElementById("status").textContent = "cleared";
+  redraw();
+}
+
+// ── Drawing ──────────────────────────────────────────────────────────────────
+function redraw() {
+  if (!events.length) { ctx.clearRect(0, 0, cv.width, cv.height); return; }
+
+  const windowSec = parseInt(document.getElementById("windowSel").value);
+  const tMax = events[events.length - 1].ts;
+  const tMin = windowSec > 0 ? tMax - windowSec * 1000 : events[0].ts;
+  const tSpan = Math.max(tMax - tMin, 1000);
+
+  // Canvas sizing
+  const wrap = document.getElementById("canvas-wrap");
+  const W = Math.max(wrap.clientWidth - 40, 600);
+  const H = canvasHeight();
+  cv.width  = W;
+  cv.height = H;
+
+  const drawW = W - LABEL_W - 16;  // drawable area width
+
+  function tsToX(ts) { return LABEL_W + ((ts - tMin) / tSpan) * drawW; }
+  function laneY(idx) { return PAD_TOP + idx * LANE_H; }
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Background grid
+  ctx.fillStyle = "#11111b";
+  ctx.fillRect(0, 0, W, H);
+
+  // Time axis ticks
+  ctx.strokeStyle = "#313244"; ctx.lineWidth = 1;
+  const tickCount = Math.floor(drawW / 80);
+  for (let i = 0; i <= tickCount; i++) {
+    const x = LABEL_W + (i / tickCount) * drawW;
+    ctx.beginPath(); ctx.moveTo(x, PAD_TOP); ctx.lineTo(x, H - PAD_BOT); ctx.stroke();
+    const label = ((tMin + (i / tickCount) * tSpan) / 1000).toFixed(1) + "s";
+    ctx.fillStyle = "#6c7086"; ctx.font = "10px monospace";
+    ctx.fillText(label, x + 2, H - 6);
+  }
+
+  // Lane backgrounds + labels
+  LANES.forEach((lane, li) => {
+    const y = laneY(li);
+    ctx.fillStyle = li % 2 === 0 ? "#12121e" : "#0f1117";
+    ctx.fillRect(0, y, W, LANE_H);
+    ctx.fillStyle = lane.color;
+    ctx.font = "11px monospace";
+    ctx.fillText(lane.label, 4, y + LANE_H / 2 + 4);
+    // Clip line
+    ctx.strokeStyle = "#313244"; ctx.lineWidth = 0.5;
+    ctx.beginPath(); ctx.moveTo(0, y + LANE_H); ctx.lineTo(W, y + LANE_H); ctx.stroke();
+  });
+
+  // Filter to visible window
+  const visible = events.filter(e => e.ts >= tMin && e.ts <= tMax);
+
+  // ── Draw each lane ──────────────────────────────────────────────────────
+  LANES.forEach((lane, li) => {
+    const y = laneY(li);
+    const cy = y + LANE_H / 2;  // center-y of lane
+    const laneEvts = visible.filter(e => lane.kinds.includes(e.kind));
+
+    if (lane.type === "wave") {
+      // Draw RMS amplitude as a filled waveform
+      if (!laneEvts.length) return;
+      ctx.beginPath();
+      ctx.moveTo(tsToX(laneEvts[0].ts), cy);
+      laneEvts.forEach(e => {
+        const x = tsToX(e.ts);
+        const amp = Math.min((e.value || 0) / 0.06, 1.0) * (LANE_H / 2 - 4);
+        ctx.lineTo(x, cy - amp);
+      });
+      // Mirror bottom
+      for (let i = laneEvts.length - 1; i >= 0; i--) {
+        const e = laneEvts[i];
+        const x = tsToX(e.ts);
+        const amp = Math.min((e.value || 0) / 0.06, 1.0) * (LANE_H / 2 - 4);
+        ctx.lineTo(x, cy + amp);
+      }
+      ctx.closePath();
+      ctx.fillStyle = lane.color + "55";
+      ctx.fill();
+      ctx.strokeStyle = lane.color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      laneEvts.forEach((e, i) => {
+        const x = tsToX(e.ts);
+        const amp = Math.min((e.value || 0) / 0.06, 1.0) * (LANE_H / 2 - 4);
+        i === 0 ? ctx.moveTo(x, cy - amp) : ctx.lineTo(x, cy - amp);
+      });
+      ctx.stroke();
+
+    } else if (lane.type === "state") {
+      // Draw speech=filled block, silence=thin line
+      let prev = null;
+      laneEvts.forEach(e => {
+        if (prev) {
+          const x0 = tsToX(prev.ts), x1 = tsToX(e.ts);
+          const isSpeech = prev.kind.endsWith("_speech");
+          ctx.fillStyle = isSpeech ? lane.color + "99" : lane.color + "22";
+          ctx.fillRect(x0, y + 6, x1 - x0, LANE_H - 12);
+        }
+        prev = e;
+      });
+      // Draw to end for last event
+      if (prev) {
+        const x0 = tsToX(prev.ts), x1 = tsToX(tMax);
+        const isSpeech = prev.kind.endsWith("_speech");
+        ctx.fillStyle = isSpeech ? lane.color + "99" : lane.color + "22";
+        ctx.fillRect(x0, y + 6, x1 - x0, LANE_H - 12);
+      }
+
+    } else if (lane.type === "spike") {
+      // Draw vertical spike proportional to value (score)
+      laneEvts.forEach(e => {
+        const x = tsToX(e.ts);
+        const h = Math.min((e.value || 0.5), 1.0) * (LANE_H - 8);
+        ctx.fillStyle = lane.color;
+        ctx.fillRect(x - 2, cy - h / 2, 4, h);
+      });
+
+    } else if (lane.type === "event") {
+      // Draw a diamond marker
+      laneEvts.forEach(e => {
+        const x = tsToX(e.ts);
+        const color = e.kind === "utterance_rejected" ? "#6c7086" : lane.color;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(x, cy - 8); ctx.lineTo(x + 6, cy);
+        ctx.lineTo(x, cy + 8); ctx.lineTo(x - 6, cy);
+        ctx.closePath(); ctx.fill();
+        // Small label
+        if (e.label) {
+          ctx.fillStyle = color; ctx.font = "9px monospace";
+          ctx.fillText(e.label.slice(0, 30), x + 8, cy + 3);
+        }
+      });
+
+    } else if (lane.type === "span") {
+      // Draw start→end as a filled rectangle
+      const starts = laneEvts.filter(e => e.kind.endsWith("_start"));
+      const ends   = laneEvts.filter(e => e.kind.endsWith("_end") || e.kind.endsWith("_result"));
+      starts.forEach(s => {
+        const end = ends.find(e => e.ts > s.ts);
+        const x0 = tsToX(s.ts);
+        const x1 = end ? tsToX(end.ts) : tsToX(tMax);
+        ctx.fillStyle = lane.color + "77";
+        ctx.fillRect(x0, y + 8, Math.max(x1 - x0, 3), LANE_H - 16);
+        ctx.strokeStyle = lane.color;
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(x0, y + 8, Math.max(x1 - x0, 3), LANE_H - 16);
+        // Label inside span if wide enough
+        if (x1 - x0 > 30 && end?.label) {
+          ctx.fillStyle = "#cdd6f4"; ctx.font = "10px monospace";
+          ctx.fillText(end.label.slice(0, 20), x0 + 4, cy + 4);
+        }
+      });
+    }
+  });
+}
+
+// ── Tooltip on hover ─────────────────────────────────────────────────────────
+cv.addEventListener("mousemove", e => {
+  const rect = cv.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  if (mx < LABEL_W) { document.getElementById("tooltip").style.display = "none"; return; }
+
+  const windowSec = parseInt(document.getElementById("windowSel").value);
+  const tMax = events.length ? events[events.length - 1].ts : 0;
+  const tMin = windowSec > 0 ? tMax - windowSec * 1000 : (events[0]?.ts ?? 0);
+  const tSpan = Math.max(tMax - tMin, 1000);
+  const drawW = cv.width - LABEL_W - 16;
+  const tHover = tMin + ((mx - LABEL_W) / drawW) * tSpan;
+
+  // Find nearest event within 20px
+  let nearest = null, nearDist = Infinity;
+  events.forEach(ev => {
+    const ex = LABEL_W + ((ev.ts - tMin) / tSpan) * drawW;
+    const d = Math.abs(ex - mx);
+    if (d < nearDist) { nearDist = d; nearest = ev; }
+  });
+
+  const tip = document.getElementById("tooltip");
+  if (nearest && nearDist < 20) {
+    const rel = ((nearest.ts - tMin) / 1000).toFixed(2);
+    tip.innerHTML = `<b>${nearest.kind}</b><br>t=${rel}s | ts=${nearest.ts}<br>`
+      + (nearest.value != null ? `value=${nearest.value.toFixed(4)}<br>` : "")
+      + (nearest.label ? `label: ${nearest.label}` : "");
+    tip.style.display = "block";
+    tip.style.left = (e.clientX + 12) + "px";
+    tip.style.top  = (e.clientY - 10) + "px";
+  } else {
+    tip.style.display = "none";
+  }
+});
+cv.addEventListener("mouseleave", () => { document.getElementById("tooltip").style.display = "none"; });
+
+// ── Poll ─────────────────────────────────────────────────────────────────────
+fetchLog();
+setInterval(fetchLog, POLL_MS);
+</script>
+</body>
+</html>

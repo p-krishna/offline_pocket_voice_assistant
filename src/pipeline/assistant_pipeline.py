@@ -29,9 +29,11 @@ from wave import open as wave_open
 
 import pyaudio
 import soundfile as sf
+import sounddevice as sd
 
 from common import stamp, _LatencyTracer
 from common.config import load_config
+from common.event_logger import logger
 from common.servers import SERVERS, _ping, _start, wait_for_servers
 from llm.gemma import GemmaLLM
 from stt.whisper_cpp import WhisperCppSTT
@@ -44,7 +46,7 @@ from wakeword.listen import WakeWordListener
 # Whisper tokens that mean "nothing was said" — never send these to the LLM.
 BLANK_TOKENS = {"[BLANK_AUDIO]", "[SILENCE]", "[MUSIC]", "(silence)", "(ambient noise)",
                 "(birds chirping)", "(chuckles)", "(speaking in foreign language)",
-                "(upbeat music)", "(crowd chattering)", "(humming)"}
+                "(upbeat music)", "(crowd chattering)", "(humming)", "(coughs)"}
 
 
 class Pipeline:
@@ -406,11 +408,8 @@ class Pipeline:
     def _play_earcon(self, pcm: np.ndarray) -> None:
         """Play a pre-baked earcon PCM array in a daemon thread (non-blocking)."""
         def _play():
-            pa = pyaudio.PyAudio()
-            st = pa.open(format=pyaudio.paInt16, channels=1,
-                        rate=self.cfg.sample_rate, output=True)
-            st.write(pcm.tobytes())
-            st.stop_stream(); st.close(); pa.terminate()
+            # use sounddevice to play the earcon in a non-blocking way
+            sd.play(pcm, samplerate=self.cfg.sample_rate, blocking=False)
         threading.Thread(target=_play, daemon=True).start()
 
 
@@ -496,6 +495,10 @@ class Pipeline:
             t     = time.monotonic()
             frame = np.frombuffer(pcm, dtype=np.int16)
 
+            # log RMS every frame (~30 ms). Cheap: single pass over frame.
+            _rms_now = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2))) / 32768.0
+            logger.amplitude(_rms_now)
+
             # Keep rolling pre-roll while idle.
             if not after_wake:
                 pre_roll.append(frame)
@@ -573,24 +576,42 @@ class Pipeline:
                                 ):
                             interrupt_active = True
                             self._viz_log(
-                                f"[{stamp()}] Interrupt detected (rms={rms:.4f})",
+                                f"[{stamp()}] Interrupt detected (rms={rms:.4f}) — switching to listen mode",
                                 rms=rms,
                                 phase="INTERRUPT",
                             )
-                            try:
-                                self.interrupt_queue.put_nowait(list(interrupt_recording))
-                                self._viz_log(
-                                    f"[{stamp()}] Interrupt audio enqueued ({len(interrupt_recording) / self.webrtc.sample_rate:.2f}) seconds)",
-                                    rms=rms,
-                                    phase="INTERRUPT",
-                                )
-                            except queue.Full:
-                                pass
-                            # Count detection here (T1 side — single writer for this counter).
+                            # Signal T2 to stop TTS (cancel_event), but do NOT
+                            # put the short interrupt_recording into the queue.
+                            # Instead, drop back into the normal post-wake capture
+                            # path so the user's full utterance is recorded via
+                            # the Silero silence-gate, just like after a wake word.
                             self._m_interrupt_detected += 1
                             self.cancel_event.set()
-                            self._set_cooldown()
-                            reset_interrupt_state()
+                            logger.interrupt(rms)
+                            # Capture interrupt_recording NOW before reset clears it.
+                            # This is the audio T1 has been accumulating during TTS —
+                            # it contains the user's first words ("one, two...").
+                            captured_so_far = list(interrupt_recording)
+                            reset_interrupt_state()            # clears interrupt_recording
+
+                            # Re-enter post-wake listening mode
+                            after_wake = True
+                            current_capture_from_conversation = True
+                            command_start = t
+                            silero_buf = np.zeros(0, dtype=np.int16)
+                            silence_frames = 0
+                            self.silero.state = None
+                            self.silero.started_at = None
+                            self.silero.history = []
+                            # Seed with captured interrupt audio, NOT stale pre_roll.
+                            recording = captured_so_far
+                            post_roll_queue = deque(maxlen=post_roll_frames)
+                            warning_played = False
+                            # Play earcon in background — don't block T1.
+                            threading.Thread(
+                                target=lambda: self._play_earcon(self.listening_earcon_pcm),
+                                daemon=True
+                            ).start()
                         elif rms < self.cfg.interrupt_energy_threshold:
                             reset_interrupt_state()
 
@@ -643,6 +664,7 @@ class Pipeline:
                     post_roll_queue = deque(maxlen=post_roll_frames)
                     self.conversation_mode.set()
                     warning_played = False
+                    logger.wakeword(score)
                     self._viz_log(
                         f"[{stamp()}] WakeWord detected: {self.cfg.wakeword} score={score:.3f}",
                         rms=self._rms([frame]),
@@ -776,6 +798,7 @@ class Pipeline:
                             phase="LISTENING",
                             elapsed_ms=command_age_ms,
                         )
+                        logger.utterance_rejected(_rms_now)
                         # A wake fired but the capture was too short/quiet — count as false wake.
                         self._m_false_wakes += 1
                         # Log a summary every N false wakes to help tune thresholds.
@@ -798,6 +821,7 @@ class Pipeline:
                             phase="LISTENING",
                             elapsed_ms=command_age_ms,
                         )
+                        logger.utterance_accepted(_rms_now)
 
                     try:
                         self.utterance_queue.put_nowait(samples)
@@ -835,7 +859,8 @@ class Pipeline:
 
             print(f"[{stamp()}] Transcript: {transcript}")
 
-            if not transcript or not transcript.strip() or transcript.strip() in BLANK_TOKENS:
+            if (not transcript) or (not transcript.strip()) or (transcript.strip() in BLANK_TOKENS) \
+                or (len(transcript.strip()) < 2):
                 return None
 
             return transcript.strip()        
@@ -853,10 +878,12 @@ class Pipeline:
                 daemon=True
             ).start()
             try:
+                logger.llm_start()
                 response = self.llm.generate(
                     user_text,
                     history=list(self.history)[:-1],
                 )
+                logger.llm_result()
                 print(f"[{stamp()}] LLM: {response}")
                 return response
             except Exception as e:
@@ -984,7 +1011,10 @@ class Pipeline:
 
             # ── STT ───────────────────────────────────────────────────────────
             _stt_t0 = time.monotonic()
+            logger.stt_start()
             transcript = _transcribe_samples(samples)
+            if transcript:
+                logger.stt_result(transcript)
             self._tracer.mark("stt_done")
             _stt_ms = (time.monotonic() - _stt_t0) * 1000.0
 
@@ -1043,7 +1073,9 @@ class Pipeline:
 
             # ── TTS ───────────────────────────────────────────────────────────
             _tts_t0 = time.monotonic()
+            logger.tts_start()
             completed = _speak_with_cancel(response)
+            logger.tts_end()
             self._tracer.mark("tts_done")
             if self.cfg.metrics_enabled:
                 print(f"[LATENCY] {self._tracer.report()}")
@@ -1180,7 +1212,9 @@ class Pipeline:
                 # Guard window at the START of TTS playback so the opening phrase
                 # doesn't self-trigger the wake word listener.
                 self._set_cooldown(self.cfg.tts_playback_guard_s)
+                logger.tts_start()
                 _speak_with_cancel(response)
+                logger.tts_end()
                 self.is_speaking.clear()
                 self.cancel_event.clear()
 

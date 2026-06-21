@@ -220,3 +220,4 @@ __marimo__/
 debug_audio/**/*
 debug_logs/**/*
 test_clips/**/*
+.vscode/mcp.json

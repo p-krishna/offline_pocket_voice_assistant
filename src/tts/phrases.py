@@ -44,7 +44,7 @@ class PhrasePlayer:
 
         # Cache dir: debug_audio/phrases/<voice>/
         # Keyed by voice so switching voices forces fresh synthesis.
-        self.cache_dir = Path(cfg.tts_output_dir) / "phrases" / self.voice
+        self.cache_dir = Path(cfg.tts_output_dir) / "phrases" / cfg.tts_voice / self.voice
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # In-memory WAV bytes, populated by warm_up().

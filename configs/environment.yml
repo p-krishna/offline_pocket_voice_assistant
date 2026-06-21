@@ -11,6 +11,8 @@ dependencies:
       - openwakeword>=0.6,<0.7
       - speexdsp-ns>=0.1.2
       - pyaudio
+      - sounddevice
+      - soundfile
       - silero-vad
       - webrtcvad
       - kokoro-onnx

@@ -9,7 +9,7 @@ class GemmaLLM:
         self.url            = cfg.llm_server_url          # http://127.0.0.1:8080
         self.system_prompt  = cfg.llm_system_prompt
         self.predict_tokens = cfg.llm_predict_tokens
-        self.timeout        = cfg.http_timeout
+        self.timeout        = 20
 
     def generate(self, transcript, history=None):
         # history is a flat list of {"role": "user"/"assistant", "content": "..."}

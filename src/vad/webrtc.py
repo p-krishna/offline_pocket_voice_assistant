@@ -5,6 +5,7 @@ import webrtcvad
 
 from common import now
 from common.config import load_config
+from common.event_logger import logger
 
 
 cfg = load_config()
@@ -39,6 +40,7 @@ class WebRTCGate:
             while self.running:
                 pcm = stream.read(self.frame_samples, exception_on_overflow=False)
                 new_state = 'speech' if self.vad.is_speech(pcm, self.sample_rate) else 'silence'
+                logger.webrtc(new_state == 'speech')
                 t = now()
                 if self.state is None:
                     self.state = new_state
