@@ -26,14 +26,24 @@ class SileroGate:
         self.started_at = None
         self.running = True
 
+    def reset(self):
+        """Forget all streaming state (call at the start of a fresh audio segment)."""
+        self.history = []
+        self.state = None
+        self.started_at = None
+        try:
+            self.model.reset_states()
+        except Exception:
+            pass
+
     def stop(self, *_):
         self.running = False
 
     def open(self):
         audio = pyaudio.PyAudio()
         kwargs = dict(format=pyaudio.paInt16, channels=1, rate=self.sample_rate, input=True, frames_per_buffer=self.chunk_size)
-        if self.mic_index is not None:
-            kwargs['input_device_index'] = self.mic_index
+        from audio.devices import resolve_from_cfg
+        kwargs['input_device_index'] = resolve_from_cfg(audio, cfg).index
         return audio, audio.open(**kwargs)
 
     def predict(self, pcm):

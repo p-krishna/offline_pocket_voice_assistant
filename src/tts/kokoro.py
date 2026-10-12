@@ -12,6 +12,10 @@ import numpy as np
 import pyaudio
 import soundfile as sf
 
+from common.log import get_logger
+
+log = get_logger("tts")
+
 
 class KokoroTTS:
     def __init__(self, cfg):
@@ -52,10 +56,11 @@ class KokoroTTS:
         buf.seek(0)
         self._play_wav_bytes(buf.read())
 
-    def _synthesize(self, text: str) -> bytes | None:
+    def _synthesize(self, text: str, beep_on_fail: bool = False) -> bytes | None:
         """
         Send one text chunk to Kokoro server, return WAV bytes.
-        Returns None and plays a beep on failure.
+        Returns None on failure (optionally playing a beep — standalone use only;
+        the pipeline reports TTS failures through its own speaker/earcons).
         """
         payload = json.dumps({"text": text, "voice": self.voice}).encode("utf-8")
         req = urllib.request.Request(
@@ -67,18 +72,19 @@ class KokoroTTS:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return resp.read()
         except Exception as e:
-            print(f"[TTS] Request failed: {e}")
-            try:
-                self._play_beep()
-            except Exception as beep_err:
-                print(f"[TTS] Beep fallback also failed: {beep_err}")
+            log.warning("TTS request failed: %s", e)
+            if beep_on_fail:
+                try:
+                    self._play_beep()
+                except Exception as beep_err:
+                    print(f"[TTS] Beep fallback also failed: {beep_err}")
             return None
 
     def speak(self, text: str) -> None:
         """Synthesize full text in one request and play it. Used for short fallback phrases."""
         if not text:
             return
-        wav_bytes = self._synthesize(text)
+        wav_bytes = self._synthesize(text, beep_on_fail=True)
         if wav_bytes is None:
             return
 
@@ -113,7 +119,7 @@ class KokoroTTS:
             return
 
         for sentence in sentences:
-            wav_bytes = self._synthesize(sentence)
+            wav_bytes = self._synthesize(sentence, beep_on_fail=True)
             if wav_bytes is None:
                 # One sentence failed — stop here, beep already played inside _synthesize.
                 break

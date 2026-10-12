@@ -4,7 +4,7 @@ PIP    ?= pip
 .PHONY: install install-system install-python-deps serve-llm serve-stt serve-tts \
         serve-all watch-servers \
         list-devices check-wakeword check-tts check-llm check-stt run-pipeline \
-		kill-servers
+		kill-servers download-wakeword-models test test-unit test-e2e test-e2e-core test-e2e-one e2e-list analyze-trace
 
 # ── System dependencies ───────────────────────────────────────────────────────
 install-system:
@@ -15,6 +15,10 @@ install-system:
 install-python-deps:
 	$(PIP) install -U pip setuptools wheel
 	$(PIP) install -r configs/requirements.txt
+
+# One-time download of the openWakeWord model files (feature extractors + hey_jarvis)
+download-wakeword-models:
+	$(PYTHON) -c "import openwakeword; openwakeword.utils.download_models(['hey_jarvis'])"
 
 # ── Server launchers (run in background) ─────────────────────────────────────
 serve-llm:
@@ -28,6 +32,7 @@ serve-tts:
 
 # ── Standalone checks (for unit testing each stage) ───────────────────────────
 list-devices:
+	PYTHONPATH=src $(PYTHON) -W ignore -m audio.devices
 	PYTHONPATH=src $(PYTHON) src/wakeword/listen.py --list-devices
 
 check-wakeword:
@@ -106,3 +111,31 @@ replay-pipeline:
 ## Create the 5 named reference test clips
 create-test-clips:
 	python src/tools/create_test_clips.py
+
+
+# ── Automated testing ─────────────────────────────────────────────────────────
+## Fast pure-logic tests (no servers, no audio hardware)
+test-unit:
+	PYTHONPATH=src:. $(PYTHON) -m pytest tests/unit -q
+
+## Human-like end-to-end evaluation: a simulated person talks to the REAL pipeline
+## (real wake word / VAD / Whisper / Gemma / Kokoro) inside a simulated room.
+## Needs the three servers up (make serve-all). Report: reports/e2e/<timestamp>/report.md
+test-e2e:
+	PYTHONPATH=src:. $(PYTHON) -W ignore tests/e2e/run_e2e.py -v
+
+## Subset, e.g. make test-e2e-core  or  make test-e2e S=barge_in_stop,speaker_echo
+test-e2e-core:
+	PYTHONPATH=src:. $(PYTHON) -W ignore tests/e2e/run_e2e.py -v --tag core
+
+test-e2e-one:
+	PYTHONPATH=src:. $(PYTHON) -W ignore tests/e2e/run_e2e.py -v -s $(S)
+
+## Summarise the newest live-session trace (debug_logs/trace_*.jsonl) or a given one: make analyze-trace T=path
+analyze-trace:
+	PYTHONPATH=src $(PYTHON) src/tools/analyze_trace.py $(T)
+
+e2e-list:
+	PYTHONPATH=src:. $(PYTHON) -W ignore tests/e2e/run_e2e.py --list
+
+test: test-unit test-e2e

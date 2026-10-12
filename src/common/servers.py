@@ -1,7 +1,12 @@
+import os
 import subprocess
+import sys
 import time
+from pathlib import Path
 import urllib.request
 import urllib.error
+
+_ROOT = Path(__file__).resolve().parents[2]
 
 # ── Server definitions ────────────────────────────────────────────────────────
 # Each entry describes one server:
@@ -29,7 +34,7 @@ SERVERS = [
         "name": "TTS",
         "port": 8082,
         "url":  "http://127.0.0.1:8082/health",
-        "cmd":  "python src/tts/serve_kokoro.py",
+        "cmd":  f"{sys.executable} -u src/tts/serve_kokoro.py",
         "env":  {"PYTHONPATH": "src"},
     },
 ]
@@ -50,14 +55,15 @@ def _start(server: dict) -> subprocess.Popen:
     Launch a server as a background subprocess.
     Returns the Popen handle so the caller can track it.
     """
-    import os
     env = {**os.environ, **server["env"]}
     proc = subprocess.Popen(
         server["cmd"],
         shell=True,
+        cwd=str(_ROOT),              # commands use project-relative paths
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=True,      # survive Ctrl+C / exit of whoever restarted them
     )
     print(f"[servers] {server['name']} started (pid={proc.pid})")
     return proc

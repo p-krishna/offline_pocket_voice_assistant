@@ -21,11 +21,12 @@ kinds used:
 """
 
 import json
+import os
 import threading
 import time
 from pathlib import Path
 
-LOG_PATH = Path("/tmp/assistant_events.jsonl")
+LOG_PATH = Path(os.getenv("ASSISTANT_EVENTS_PATH", "/tmp/assistant_events.jsonl"))
 
 
 class EventLogger:
@@ -34,7 +35,11 @@ class EventLogger:
         self._lock = threading.Lock()
         # Clear the log at each session start so the visualizer always
         # shows data from the current run only.
-        self._path.write_text("")
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text("")
+        except OSError:
+            pass
 
     def log(self, kind: str, value: float = None, label: str = None):
         entry = {"ts": int(time.time() * 1000), "kind": kind}
@@ -43,8 +48,11 @@ class EventLogger:
         if label is not None:
             entry["label"] = label[:200]
         with self._lock:
-            with self._path.open("a") as fh:
-                fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            try:
+                with self._path.open("a") as fh:
+                    fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            except OSError:
+                pass  # visualiser log is best-effort; never break the pipeline
 
     # ── convenience helpers ───────────────────────────────────────────────
     def amplitude(self, rms: float):          self.log("amplitude", value=rms)

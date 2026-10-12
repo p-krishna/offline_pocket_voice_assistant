@@ -11,17 +11,6 @@ from common.event_logger import logger
 
 
 cfg = load_config()
-parser = argparse.ArgumentParser(description='Wake word listener')
-parser.add_argument('--list-devices', action='store_true', help='List audio devices and exit')
-args = parser.parse_args()
-
-if args.list_devices:
-    audio = pyaudio.PyAudio()
-    for i in range(audio.get_device_count()):
-        info = audio.get_device_info_by_index(i)
-        print(f"[{i}] {info.get('name')} | input={int(info.get('maxInputChannels', 0))} | output={int(info.get('maxOutputChannels', 0))}")
-    audio.terminate()
-    raise SystemExit(0)
 
 
 class WakeWordListener:
@@ -31,7 +20,7 @@ class WakeWordListener:
         self.chunk_size = cfg.wakeword_chunk_size
         self.threshold = cfg.wakeword_threshold
         self.trigger_level = cfg.wakeword_trigger_level
-        self.model = Model(wakeword_models=[self.wakeword], vad_threshold=cfg.wakeword_vad_threshold, enable_speex_noise_suppression=cfg.wakeword_enable_speex_noise_suppression)
+        self.model = Model(wakeword_models=[self.wakeword], vad_threshold=cfg.wakeword_vad_threshold, enable_speex_noise_suppression=cfg.wakeword_enable_speex_noise_suppression, inference_framework=cfg.wakeword_framework)
         self.mic_index = cfg.microphone_index
         self.hits = 0
         self.running = True
@@ -42,8 +31,8 @@ class WakeWordListener:
     def open(self):
         audio = pyaudio.PyAudio()
         kwargs = dict(format=pyaudio.paInt16, channels=1, rate=self.sample_rate, input=True, frames_per_buffer=self.chunk_size)
-        if self.mic_index is not None:
-            kwargs['input_device_index'] = self.mic_index
+        from audio.devices import resolve_from_cfg
+        kwargs['input_device_index'] = resolve_from_cfg(audio, cfg).index
         return audio, audio.open(**kwargs)
 
     def run(self, on_detect, on_score=None):
@@ -67,3 +56,20 @@ class WakeWordListener:
                     on_detect(score, now())
         finally:
             stream.stop_stream(); stream.close(); audio.terminate()
+
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Wake word listener')
+    parser.add_argument('--list-devices', action='store_true', help='List audio devices and exit')
+    args = parser.parse_args()
+
+    if args.list_devices:
+        audio = pyaudio.PyAudio()
+        for i in range(audio.get_device_count()):
+            info = audio.get_device_info_by_index(i)
+            print(f"[{i}] {info.get('name')} | input={int(info.get('maxInputChannels', 0))} | output={int(info.get('maxOutputChannels', 0))}")
+        audio.terminate()
+        raise SystemExit(0)
+
+    WakeWordListener().run(lambda score, t: print(f"WAKE score={score:.2f}"))

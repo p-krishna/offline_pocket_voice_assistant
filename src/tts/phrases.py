@@ -1,39 +1,72 @@
 """
 System phrase cache.
 
-Synthesizes short status phrases once at startup and stores them as WAV
-files on disk. On subsequent runs the files are reused — no HTTP call needed.
+Short status phrases ("Let me think about that", "Sorry, I didn't catch that")
+are synthesized once and stored as WAV files on disk, so they play instantly
+with no TTS round-trip — which matters most exactly when something is slow or
+broken (the TTS server might be the thing that is down).
 
-All phrases use cfg.system_voice so switching voices later requires only a
-config change (and deleting the cache dir to force re-synthesis).
+Cache files are named <key>.<hash-of-text>.wav, so editing a phrase's text
+automatically invalidates its cached audio.
 
 Usage:
-    from tts.phrases import PhrasePlayer
     phrases = PhrasePlayer(cfg)
-    phrases.warm_up()          # call once after wait_for_servers()
-    phrases.play("listening")  # non-blocking, plays in caller's thread
+    phrases.warm_up()              # once, after wait_for_servers()
+    phrases.get("thinking")        # → (int16 pcm, sample_rate) or None
+    phrases.pick("progress")       # → (key, pcm, sr), rotates through variants
 """
 
+import hashlib
 import json
 import time
 import urllib.request
 from pathlib import Path
 
 import numpy as np
-import pyaudio
-import soundfile as sf
 
+from common.log import get_logger
+
+log = get_logger("phrases")
 
 # Canonical phrase keys → text to synthesize.
 PHRASES = {
-    "listening":       "Listening",
-    "thinking":        "Thinking",
+    # --- session ---
+    "yes":             "Yes?",
+    "listening":       "I'm listening.",
+    "going_to_sleep":  "Are you still there? I'll go to sleep soon.",
+    "goodbye":         "Okay, going to sleep. Just say the wake word when you need me.",
+    "okay":            "Okay.",
+    # --- slow inference narration ---
+    "thinking":        "Let me think about that.",
+    "thinking_2":      "One moment please.",
+    "still_working":   "Still working on it.",
+    "still_working_2": "This is taking a little longer than usual. Thanks for waiting.",
+    "almost":          "Almost there.",
+    "long_wait":       "Sorry, this is a hard one. Still thinking.",
+    # --- recoverable problems ---
+    "didnt_catch":     "Sorry, I didn't catch that. Could you say it again?",
     "i_heard_you":     "I heard you, one moment",
     "repeat_that":     "Could you repeat that",
     "please_wait":     "Please wait, still thinking",
-    "going_to_sleep":  "Going to sleep soon",
-    "goodbye":         "I am going to sleep, goodbye",
+    "nothing_to_repeat": "I haven't said anything yet.",
+    # --- failures (always spoken, so the assistant never goes silently dead) ---
+    "fallback_stt":     "Sorry, my hearing is having trouble. Please try again in a moment.",
+    "fallback_llm":     "Sorry, I'm having trouble thinking right now. Please try again in a moment.",
+    "fallback_tts":     "Sorry, my voice is having trouble. Please try again.",
+    "fallback_generic": "Sorry, something went wrong. Please try again.",
+    "llm_timeout":      "Sorry, that took too long and I had to give up. Could you ask again, maybe more simply?",
 }
+
+# Groups used to rotate wording so repeated waits don't sound robotic.
+GROUPS = {
+    "progress_first": ["thinking", "thinking_2"],
+    "progress_next":  ["still_working", "still_working_2"],
+    "progress_long":  ["long_wait", "almost"],
+}
+
+
+def _fname(key: str, text: str) -> str:
+    return f"{key}.{hashlib.sha1(text.encode()).hexdigest()[:8]}.wav"
 
 
 class PhrasePlayer:
@@ -42,57 +75,77 @@ class PhrasePlayer:
         self.voice   = cfg.system_voice
         self.timeout = cfg.http_timeout
 
-        # Cache dir: debug_audio/phrases/<voice>/
-        # Keyed by voice so switching voices forces fresh synthesis.
-        self.cache_dir = Path(cfg.tts_output_dir) / "phrases" / cfg.tts_voice / self.voice
+        # Cache dir: <tts_output_dir>/phrases/<voice>/ — keyed by voice so
+        # switching voices forces fresh synthesis.
+        self.cache_dir = Path(cfg.tts_output_dir) / "phrases" / self.voice
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # In-memory WAV bytes, populated by warm_up().
-        self._cache: dict[str, bytes] = {}
+        self._cache: dict[str, tuple[np.ndarray, int]] = {}
+        self._rot: dict[str, int] = {}
 
     # ── Startup ──────────────────────────────────────────────────────────────
 
     def warm_up(self) -> None:
-        """
-        For each phrase:
-          - If the WAV file already exists on disk, load it.
-          - Otherwise synthesize via Kokoro server and save to disk.
-        Call this once after wait_for_servers() returns.
-        """
+        """Load every phrase from disk, synthesizing (once) any that are missing."""
+        from audio.speaker import pcm_from_wav_bytes
+        t0 = time.monotonic()
+        synthesized = 0
         for key, text in PHRASES.items():
-            path = self.cache_dir / f"{key}.wav"
+            path = self.cache_dir / _fname(key, text)
+            wav = None
             if path.exists():
-                # Reuse existing file — no HTTP call needed.
-                self._cache[key] = path.read_bytes()
-                print(f"[phrases] Loaded from cache: {key}")
+                wav = path.read_bytes()
             else:
-                # Synthesize and persist.
                 wav = self._synthesize(text)
                 if wav:
                     path.write_bytes(wav)
-                    self._cache[key] = wav
-                    print(f"[phrases] Synthesized and cached: {key}")
+                    synthesized += 1
                 else:
-                    print(f"[phrases] WARNING: could not synthesize '{key}' — will be silent")
+                    log.warning("could not synthesize phrase '%s' — it will be silent", key)
+            if wav:
+                try:
+                    self._cache[key] = pcm_from_wav_bytes(wav)
+                except Exception as e:
+                    log.warning("bad cached phrase '%s': %s", key, e)
+        log.info("phrases ready: %d/%d (%d newly synthesized) in %.1fs",
+                 len(self._cache), len(PHRASES), synthesized, time.monotonic() - t0)
 
-    # ── Playback ─────────────────────────────────────────────────────────────
+    # ── Lookup ───────────────────────────────────────────────────────────────
+
+    def get(self, key: str):
+        """(int16 pcm, sample_rate) for a phrase, or None if unavailable."""
+        return self._cache.get(key)
+
+    def pick(self, group: str):
+        """Next variant of a phrase group → (key, pcm, sr) or None."""
+        keys = [k for k in GROUPS.get(group, [group]) if k in self._cache]
+        if not keys:
+            return None
+        i = self._rot.get(group, 0)
+        self._rot[group] = i + 1
+        k = keys[i % len(keys)]
+        pcm, sr = self._cache[k]
+        return k, pcm, sr
+
+    # ── Standalone playback (used only by this module's self-test) ───────────
 
     def play(self, key: str) -> None:
-        """
-        Play a cached phrase by key.
-        Blocks until audio finishes — call from a thread if needed.
-        Silently skips if the key was not cached (e.g. synthesis failed).
-        """
-        wav = self._cache.get(key)
-        if not wav:
+        import pyaudio
+        item = self.get(key)
+        if not item:
             print(f"[phrases] No cache for '{key}', skipping")
             return
-        self._play_wav_bytes(wav)
+        pcm, sr = item
+        pa = pyaudio.PyAudio()
+        stream = pa.open(format=pyaudio.paInt16, channels=1, rate=sr, output=True, frames_per_buffer=4096)
+        stream.write(pcm.tobytes())
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
 
     # ── Internals ────────────────────────────────────────────────────────────
 
     def _synthesize(self, text: str) -> bytes | None:
-        """Send text to Kokoro server, return WAV bytes or None on failure."""
         payload = json.dumps({"text": text, "voice": self.voice}).encode("utf-8")
         req = urllib.request.Request(
             f"{self.url}/synthesize",
@@ -100,30 +153,11 @@ class PhrasePlayer:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, 30)) as resp:
                 return resp.read()
         except Exception as e:
-            print(f"[phrases] Synthesis failed for '{text}': {e}")
+            log.warning("synthesis failed for '%s': %s", text, e)
             return None
-
-    def _play_wav_bytes(self, wav_bytes: bytes) -> None:
-        """Play raw WAV bytes via PyAudio with a buffer size that avoids underruns."""
-        import io
-        buf = io.BytesIO(wav_bytes)
-        audio_data, sample_rate = sf.read(buf, dtype="float32")
-        pcm = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-        pa = pyaudio.PyAudio()
-        stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=sample_rate,
-            output=True,
-            frames_per_buffer=4096,
-        )
-        stream.write(pcm)
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
 
 
 # ── Standalone test ───────────────────────────────────────────────────────────

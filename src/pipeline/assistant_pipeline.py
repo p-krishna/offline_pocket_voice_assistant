@@ -1,352 +1,255 @@
 """
-assistant_pipeline.py — threaded voice assistant pipeline.
+assistant_pipeline.py — threaded, fully local voice assistant.
 
-Architecture:
-  Thread 1 (_audio_thread)      — mic read, wake word, Silero, interrupt detection
-  Thread 2 (_processing_thread) — STT → LLM → TTS, cancellable between sentences
+Threads
+  AudioThread      mic → (WebRTC gate → wake word) | capture (Silero endpointing)
+                   | barge-in detection while the assistant is busy
+  ProcessingThread STT → intent/LLM(stream) → TTS(stream), one turn at a time
+  SpeakerThread    (audio/speaker.py) the only thing that makes sound
+  ProgressNarrator per-turn helper that keeps the user informed while waiting
 
-Shared state:
-  utterance_queue   Queue(1)  — T1 puts utterance samples, T2 gets them
-  interrupt_queue   Queue(1)  — T1 puts interrupt samples, T2 gets them
-  cancel_event      Event     — T1 sets when interrupt confirmed; T2 checks between sentences
-  is_speaking       Event     — T2 sets during TTS; T1 enables interrupt detection
-  processing_busy   Event     — T2 sets during STT/LLM/TTS for a normal turn
-  conversation_mode Event     — set after wake word; cleared after 45s silence
+Conversation model
+  IDLE   → wake word → AWAKE (conversation open: no wake word needed for follow-ups)
+  AWAKE  → CONVERSATION_TIMEOUT_S of quiet → warning → IDLE
+  A "turn" = capture → STT → answer. At most one turn is active; speaking over
+  the assistant (barge-in) cancels the active turn and starts the next one.
+
+Cancellation is epoch based: Speaker.epoch is bumped by Speaker.stop(); every
+stage of a turn remembers the epoch it started in and abandons work as soon as
+the epoch moves on (LLM stream is hung up, queued TTS is dropped).
+
+Every transition is recorded in the structured trace (common/log.py) which the
+automated evaluator in tests/e2e consumes.
 """
 
-import sys
-import io
-import re
-import threading
-import queue
-import time
-import datetime
-import numpy as np
-from collections import deque
+from __future__ import annotations
+
 import json
+import queue
+import re
+import signal
+import sys
+import threading
+import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import List, Optional
 from wave import open as wave_open
 
-import pyaudio
-import soundfile as sf
-import sounddevice as sd
+import numpy as np
 
-from common import stamp, _LatencyTracer
+from audio.aec import EchoCanceller, ReferenceBuffer
+from audio.mic import MicBase, PyAudioMic
+from audio.sounds import build_earcons, make_calibration
+from audio.speaker import AudioItem, PyAudioBackend, Speaker, SpeakerBackend
+from common import stamp
 from common.config import load_config
 from common.event_logger import logger
+from common.log import get_logger, now_s, trace
 from common.servers import SERVERS, _ping, _start, wait_for_servers
-from llm.gemma import GemmaLLM
-from stt.whisper_cpp import WhisperCppSTT
+from llm.gemma import GemmaLLM, LLMError, LLMTimeout
+from pipeline import textutils as tu
+from pipeline.speech import SpeechStreamer
+from stt.whisper_cpp import STTResult, WhisperCppSTT
 from tts.kokoro import KokoroTTS
 from tts.phrases import PhrasePlayer
 from vad.silero import SileroGate
 from vad.webrtc import WebRTCGate
 from wakeword.listen import WakeWordListener
 
-# Whisper tokens that mean "nothing was said" — never send these to the LLM.
-BLANK_TOKENS = {"[BLANK_AUDIO]", "[SILENCE]", "[MUSIC]", "(silence)", "(ambient noise)",
-                "(birds chirping)", "(chuckles)", "(speaking in foreign language)",
-                "(upbeat music)", "(crowd chattering)", "(humming)", "(coughs)"}
+log = get_logger("pipeline")
+
+BLANK_TOKENS = tu.BLANK_TOKENS   # re-exported for older tools
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Data carried between threads
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class Utterance:
+    samples: List[np.ndarray]          # int16 frames
+    source: str                        # "wake" | "followup" | "barge"
+    speech_ms: float
+    rms: float
+    t_eos: float                       # monotonic: when the user (approximately) stopped talking
+    t_queued: float
+    wake_score: float = 0.0
+    text: Optional[str] = None         # pre-transcribed (interjections are transcribed before they cancel a turn)
+    stt: Optional[STTResult] = None    # confidence of the transcript when it is known
+    stt_future: Optional[Future] = None  # speculative transcript started while the user was still in the silence hold
+
+
+@dataclass
+class Capture:
+    """State of one in-progress utterance capture (audio thread only)."""
+    source: str
+    t_start: float
+    frames: List[np.ndarray] = field(default_factory=list)
+    sbuf: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int16))
+    ms: float = 0.0                    # audio time captured
+    speech_ms: float = 0.0
+    last_speech_ms: float = 0.0
+    heard: bool = False
+    wake_score: float = 0.0
+    wakeish: bool = False              # the wake phrase was heard in this capture
+    speech_sq: float = 0.0             # for the user's typical speaking level
+    speech_frames: int = 0
+    spec: Optional["Spec"] = None      # speculative STT in flight / done
+
+
+@dataclass
+class Spec:
+    fut: Future
+    last_speech_ms: float              # speech position the snapshot covered; newer speech invalidates it
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Slow-inference narration
+# ──────────────────────────────────────────────────────────────────────────────
+class ProgressNarrator(threading.Thread):
+    """
+    Keeps the user informed while the answer is not ready yet. Started as soon
+    as the user finishes speaking, stopped as soon as answer audio is queued.
+
+      0 s            soft "ack" tick (played by the audio thread)
+      first_phrase_s spoken filler ("Let me think about that.")
+      then           a gentle pulse every pulse_every_s
+      every phrase_every_s  a spoken reassurance ("Still working on it.")
+    """
+
+    def __init__(self, pipe: "Pipeline", epoch: int, turn: int, t_eos: float):
+        super().__init__(name=f"Narrator{turn}", daemon=True)
+        self.pipe, self.epoch, self.turn, self.t_eos = pipe, epoch, turn, t_eos
+        self._halt = threading.Event()
+        self.events = 0
+
+    def stop(self) -> None:
+        self._halt.set()
+
+    def _alive(self) -> bool:
+        return not self._halt.is_set() and self.pipe.speaker.epoch == self.epoch and self.pipe.running.is_set()
+
+    def run(self) -> None:
+        cfg = self.pipe.cfg
+        waited_phrases = 0
+        next_at = cfg.progress_first_phrase_s
+        last_phrase_at = None
+        while self._alive():
+            timeout = max(0.0, self.t_eos + next_at - time.monotonic())
+            if self._halt.wait(min(timeout, 0.25)):
+                return
+            if time.monotonic() < self.t_eos + next_at:
+                continue
+            if not self._alive():
+                return
+            elapsed = time.monotonic() - self.t_eos
+            need_phrase = last_phrase_at is None or (elapsed - last_phrase_at) >= cfg.progress_phrase_every_s
+            if need_phrase and self.pipe.llm_streaming_recently():
+                # Tokens are flowing, the first sentence is imminent: a spoken filler
+                # would only delay it (the speaker plays one sound at a time).
+                next_at = elapsed + 0.4
+                continue
+            if need_phrase:
+                group = "progress_first" if waited_phrases == 0 else (
+                    "progress_next" if waited_phrases == 1 else "progress_long")
+                picked = self.pipe.phrases.pick(group)
+                if picked:
+                    key, pcm, sr = picked
+                    trace.emit("progress", turn=self.turn, kind="phrase", key=key, waited_s=round(elapsed, 2))
+                    log.info("still waiting (%.1fs) → saying '%s'", elapsed, key)
+                    self.pipe.speaker.enqueue(AudioItem("phrase", pcm, sr, label=key, epoch=self.epoch))
+                    self.events += 1
+                waited_phrases += 1
+                last_phrase_at = elapsed
+            else:
+                trace.emit("progress", turn=self.turn, kind="pulse", waited_s=round(elapsed, 2))
+                self.pipe._earcon("pulse", epoch=self.epoch)
+                self.events += 1
+            next_at = elapsed + cfg.progress_pulse_every_s
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pipeline
+# ──────────────────────────────────────────────────────────────────────────────
 class Pipeline:
-    def __init__(self):
-        # Single shared config — every stage reads from this.
-        self.cfg = load_config()
-
-        self._tracer = _LatencyTracer()
-        self._last_response: str = ""   # for __REPEAT__ fast path
+    def __init__(self, cfg=None, mic: Optional[MicBase] = None,
+                 speaker_backend: Optional[SpeakerBackend] = None):
+        self.cfg = cfg or load_config()
+        self._injected_mic = mic
 
         # VAD / wake word components.
         self.webrtc = WebRTCGate()
-        self.wake   = WakeWordListener()
+        self.wake = WakeWordListener()
         self.silero = SileroGate()
 
         # AI stage clients (HTTP only — no model loading here).
         self.stt = WhisperCppSTT(self.cfg)
         self.llm = GemmaLLM(self.cfg)
         self.tts = KokoroTTS(self.cfg)
-
-        # System phrase player — synthesized once at startup, reused from disk.
         self.phrases = PhrasePlayer(self.cfg)
 
-        # Rolling conversation history.
-        # maxlen * 2 because each turn = 2 messages (user + assistant).
+        # Audio out: one serialised speaker for everything the assistant says.
+        self._backend = speaker_backend
+        self.speaker: Optional[Speaker] = None
+        self.earcons = build_earcons(self.cfg.sample_rate)
+
+        # Conversation memory (alternating user/assistant messages).
         self.history: deque = deque(maxlen=self.cfg.memory_turns * 2)
+        self._last_response = ""
 
-        # ── Shared threading primitives ───────────────────────────────────────
-
-        # T1 → T2: audio samples for a complete utterance.
-        # maxsize=1: if T2 is busy, T1 drops and plays "please wait".
-        self.utterance_queue: queue.Queue = queue.Queue(maxsize=1)
-
-        # T1 → T2: audio samples for an interrupt utterance.
-        self.interrupt_queue: queue.Queue = queue.Queue(maxsize=1)
-
-        # T1 → T2: set when interrupt is confirmed. T2 checks between sentences.
-        self.cancel_event = threading.Event()
-
-        # T2 → T1: set while TTS is playing. Enables interrupt detection in T1.
-        self.is_speaking = threading.Event()
-
-        # T2 → T1: set while processing a normal turn.
-        # Prevents T1 from starting a fresh capture too early.
-        self.processing_busy = threading.Event()
-
-        # Shared: set after wake word fires; cleared after conversation timeout.
-        self.conversation_mode = threading.Event()
-
-        # Hard cooldown after assistant/system audio so the assistant does not
-        # hear itself and immediately start a fresh turn.
-        self.cooldown_until = 0.0
-
-        # Shared timestamp used by conversation timeout.
-        self._last_tts_end_time = None
-
-        # Clean shutdown signal for both threads.
+        # Thread coordination.
+        self.utterance_queue: "queue.Queue[Utterance]" = queue.Queue(maxsize=1)
+        self.turn_active = threading.Event()       # an utterance is queued or being processed
+        self.conversation_mode = threading.Event() # AWAKE
         self.running = threading.Event()
-        self.running.set()
+        self.last_activity = time.monotonic()
+        self._threads: List[threading.Thread] = []
+        self._mic: Optional[MicBase] = None
 
-        # ── Day 1 Metrics counters ────────────────────────────────────────────
-        # All counters are for the lifetime of the pipeline process.
-        # Thread-safety: only _audio_thread writes wake/drop counters;
-        # only _processing_thread writes stt/llm/tts/interrupt counters.
-        # No lock needed because each counter has a single writer.
-        self._m_turns              = 0     # completed turn attempts (samples dequeued)
-        self._m_dropped            = 0     # utterances dropped — queue full
-        self._m_false_wakes        = 0     # wakes that produced no valid utterance
-        self._m_blank_stt          = 0     # STT returned blank / noise token
-        self._m_interrupt_detected = 0     # interrupt threshold crossed (T1 side)
-        self._m_interrupt_success  = 0     # interrupt -> non-blank transcript used
-        self._m_server_restarts    = 0     # server restart attempts
-        self._last_debug_wav       = None  # reset each turn; set by save_debug_wav
-
-        self._FP = [
-            (re.compile(r'\b(what(?:\'s| is) the time|current time|what time is it)\b', re.I),
-            lambda: f"It's {datetime.now().strftime('%I:%M %p').lstrip('0')}"),
-            (re.compile(r'\b(today(?:\'s)? date|what(?:\'s| is) the date)\b', re.I),
-            lambda: f"Today is {datetime.now().strftime('%A, %B %d')}"),
-            (re.compile(r'\b(stop|cancel|nevermind|quit|exit|shut ?up)\b', re.I),
-            lambda: "__STOP__"),
-            (re.compile(r'\b(hello|hi there|hey there)\b', re.I),
-            lambda: "Hello! How can I help?"),
-            (re.compile(r'\b(thank(?:s| you))\b', re.I),
-            lambda: "You're welcome!"),
-            (re.compile(r'\b(repeat(?: that)?|say that again)\b', re.I),
-            lambda: "__REPEAT__"),
-        ]
-
-        ## Pre-synthesise earcons at startup for instant playback when needed.
-        sr = self.cfg.sample_rate
-
-        # WAKE DETECTED — ascending two-tone (mirror of interrupt)
-        # 660 Hz → 880 Hz, 90 ms each: "something woke up, going up"
-        self.wake_earcon_pcm = self._make_earcon(
-            [(660, 0.09), (880, 0.09)], sr
-        )
-
-        # LISTENING STARTED — single short high pip
-        # 1046 Hz (C6), 70 ms: crisp, attention-grabbing "ready now"
-        self.listening_earcon_pcm = self._make_earcon(
-            [(1046, 0.07)], sr, amplitude=10000
-        )
-
-        # THINKING — two soft rising pulses, slower
-        # 523 Hz → 659 Hz → 784 Hz, 100 ms each: "working on it"
-        self.thinking_earcon_pcm = self._make_earcon(
-            [(523, 0.10), (659, 0.10), (784, 0.10)], sr, amplitude=9000
-        )
-
-        # INTERRUPT — descending two-tone, quick and attention-grabbing but not too harsh.
-        # 880 Hz → 660 Hz, 90 ms each: "something interrupted me, going down"
-        self.interrupt_earcon_pcm = self._make_earcon(
-            [(880, 0.09), (660, 0.09)], sr   # descending — barge-in registered
-        )
-
-        # ERROR — descending tritone, slightly longer
-        # 440 Hz → 311 Hz → 220 Hz, 100 ms each: "something went wrong"
-        self.error_earcon_pcm = self._make_earcon(
-            [(440, 0.10), (311, 0.10), (220, 0.10)], sr, amplitude=11000
-        )
-
-        # SLEEP / GOODBYE — slow falling three-tone
-        # 880 Hz → 523 Hz → 330 Hz, 120 ms each: "going away"
-        self.sleep_earcon_pcm = self._make_earcon(
-            [(880, 0.12), (523, 0.12), (330, 0.12)], sr, amplitude=11000
-        )
+        # Counters.
+        self._m_turns = 0
+        self._m_dropped = 0
+        self._m_false_wakes = 0
+        self._m_blank_stt = 0
+        self._m_interrupt_detected = 0
+        self._m_interrupt_success = 0
+        self._m_server_restarts = 0
+        self._last_debug_wav = None
+        self._echo_ratio = 0.0                     # learned speaker→mic coupling
+        self._llm_first_token_t: Optional[float] = None
+        self._user_level: Optional[float] = None   # typical RMS of the user's voice (speech frames)
+        self.aec: Optional[EchoCanceller] = None
+        if self.cfg.aec_enabled:
+            self.aec = EchoCanceller(block=self.webrtc.frame_samples, partitions=self.cfg.aec_partitions,
+                                     mu=self.cfg.aec_mu, sr=self.cfg.sample_rate,
+                                     ref=ReferenceBuffer(self.cfg.sample_rate))
+        self._stt_pool: Optional[ThreadPoolExecutor] = None
+        self._server_procs: dict = {}
 
     # ------------------------------------------------------------------
-    # Startup validation helpers
+    # Small helpers
     # ------------------------------------------------------------------
-    def _validate_config(self) -> None:
-        """
-        Validate critical config: model paths, server URLs, ports.
-        Exit fast on misconfiguration so the user gets a clear error.
-        """
+    def llm_streaming_recently(self, within_s: float = 2.5) -> bool:
+        t = self._llm_first_token_t
+        return t is not None and (time.monotonic() - t) < within_s
 
-        # Validate server URLs / ports from SERVERS table.
-        # This catches obvious port conflicts / bad URLs at startup.
-        seen_ports = set()
-        for srv in SERVERS:
-            url = srv.get("url", "")
-            name = srv.get("name", "unknown")
-            if "://" not in url:
-                print(f"[{stamp()}] Config error: invalid URL for {name}: {url}")
-                sys.exit(1)
+    def _earcon(self, name: str, epoch: Optional[int] = None) -> None:
+        pcm = self.earcons[name]
+        self.speaker.enqueue(AudioItem("earcon", pcm, self.cfg.sample_rate, label=name, epoch=epoch))
 
-            # Very small parser: assume http://host:port
-            try:
-                host_port = url.split("://", 1)[1].split("/", 1)[0]
-                host, port_str = host_port.rsplit(":", 1)
-                port = int(port_str)
-            except Exception:
-                print(f"[{stamp()}] Config error: cannot parse port from {name} URL: {url}")
-                sys.exit(1)
-
-            if port in seen_ports:
-                print(f"[{stamp()}] Config error: duplicate port {port} in SERVERS")
-                sys.exit(1)
-            seen_ports.add(port)
-
-    def _validate_microphone(self) -> None:
-        """
-        Ensure the configured input device and sample rate are available
-        before starting audio / processing threads.
-        """
-        pa = pyaudio.PyAudio()
-        try:
-            device_index = getattr(self.cfg, "input_device_index", None)
-            sample_rate = int(self.cfg.sample_rate)
-
-            # If user pinned a device index, ensure it exists.
-            if device_index is not None:
-                try:
-                    info = pa.get_device_info_by_index(device_index)
-                except Exception as e:
-                    print(f"[{stamp()}] Audio error: input_device_index {device_index} invalid: {e}")
-                    sys.exit(1)
-                if info.get("maxInputChannels", 0) <= 0:
-                    print(f"[{stamp()}] Audio error: device {device_index} has no input channels")
-                    sys.exit(1)
-
-            # Try opening a tiny test stream to confirm sample-rate assumptions.
-            try:
-                test_stream = pa.open(
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=sample_rate,
-                    input=True,
-                    input_device_index=device_index,
-                    frames_per_buffer=256,
-                )
-                test_stream.close()
-            except Exception as e:
-                print(
-                    f"[{stamp()}] Audio error: cannot open input stream at "
-                    f"{sample_rate} Hz (device={device_index}): {e}"
-                )
-                sys.exit(1)
-
-            print(
-                f"[{stamp()}] Audio OK: device={device_index} sample_rate={sample_rate}"
-            )
-        finally:
-            pa.terminate()
-
-    # ------------------------------------------------------------------
-    # Debug helpers
-    # ------------------------------------------------------------------
-    def save_debug_wav(self, samples, prefix="utterance") -> None:
-        if not self.cfg.debug_save_wav or not samples:
-            return
-
-        out_dir = Path(self.cfg.debug_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"{prefix}_{int(time.time())}.wav"
-
-        with wave_open(str(path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(self.cfg.sample_rate)
-            wf.writeframes(np.concatenate(samples).astype(np.int16).tobytes())
-
-        print(f"[{stamp()}] Debug WAV saved: {path}")
-
-        # Store path so _log_turn can reference it for this turn
-        self._last_debug_wav = path
-    
-    def _log_turn(self, turn_data: dict) -> None:
-        """
-        Append one JSON line per turn to a daily JSONL file.
-        Each line is a self-contained record — easy to grep, stream, or replay.
-        Fields: ts, turn, transcript, response_chars, stt_ms, llm_ms, tts_ms,
-                total_ms, interrupted, failed, debug_wav
-        """
-        log_dir = Path(self.cfg.turnlogdir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        # One file per day so logs don't grow unbounded
-        day = time.strftime("%Y-%m-%d")
-        log_path = log_dir / f"turns_{day}.jsonl"
-        with open(log_path, "a") as f:
-            f.write(json.dumps(turn_data) + "\n")
-
-    def _viz_log(
-        self,
-        msg: str,
-        *,
-        # These are optional — only passed from _audio_thread where values exist
-        rms: float | None = None,
-        silero_prob: float | None = None,
-        webrtc_state: str | None = None,
-        phase: str | None = None,
-        elapsed_ms: float | None = None,
-    ) -> None:
-        """
-        Print msg unconditionally (preserves all existing log output).
-        When debug_mode is on, also print a structured ASCII viz line
-        BEFORE the message so the event is clearly anchored to live stats.
-        Thread-safe: print() holds the GIL per call, so lines don't interleave.
-        """
-        if self.cfg.debug_mode and any(
-            v is not None for v in (rms, silero_prob, webrtc_state, phase, elapsed_ms)
-        ):
-            # --- RMS bar (20 chars wide, scaled 0→0.05 for voice range) ---
-            bar_max = 0.05          # RMS above 0.05 is very loud speech
-            rms_val = rms or 0.0
-            filled = int(min(rms_val / bar_max, 1.0) * 20)
-            rms_bar = "█" * filled + "░" * (20 - filled)
-
-            # --- Silero bar (10 chars, 0→1 probability) ---
-            sil_val = silero_prob or 0.0
-            sil_filled = int(min(sil_val, 1.0) * 10)
-            sil_bar = "▓" * sil_filled + "·" * (10 - sil_filled)
-
-            # --- Compose the viz prefix line ---
-            parts = []
-            if elapsed_ms is not None:
-                parts.append(f"T+{elapsed_ms:6.0f}ms")
-            if rms is not None:
-                parts.append(f"RMS[{rms_bar}]{rms_val:.4f}")
-            if webrtc_state is not None:
-                tag = "SPK" if webrtc_state == "speech" else "SIL"
-                parts.append(f"WebRTC:{tag}")
-            if silero_prob is not None:
-                parts.append(f"Silero[{sil_bar}]{sil_val:.2f}")
-            if phase is not None:
-                parts.append(f"Phase:{phase}")
-
-            print("  VIZ | " + " | ".join(parts))
-
-        print(msg)
-
-    # ── RMS energy helper ─────────────────────────────────────────────────────
+    def _say(self, key: str, epoch: Optional[int] = None) -> Optional[AudioItem]:
+        """Queue a cached system phrase. Never blocks."""
+        got = self.phrases.get(key)
+        if not got:
+            log.warning("phrase '%s' unavailable", key)
+            return None
+        pcm, sr = got
+        return self.speaker.enqueue(AudioItem("phrase", pcm, sr, label=key, epoch=epoch))
 
     @staticmethod
     def _rms(frames: list) -> float:
-        """
-        Compute normalised RMS energy of a list of int16 numpy frames.
-        Returns a value in [0.0, 1.0]. Used to filter low-energy noise.
-        """
         if not frames:
             return 0.0
         combined = np.concatenate(frames).astype(np.float32) / 32768.0
@@ -354,1056 +257,979 @@ class Pipeline:
 
     @staticmethod
     def _is_breath_or_hiss(frames: list, sample_rate: int) -> bool:
-        """True if audio looks like a breath or hiss rather than voiced speech.
-        Uses spectral centroid > 4 kHz AND zero-crossing rate > 0.35.
-        Both must fire to reject — avoids dropping sibilant speech like 'stop'."""
+        """True if audio looks like a breath or hiss (high centroid AND high ZCR)."""
         if not frames:
             return False
         pcm = np.concatenate(frames).astype(np.float32) / 32768.0
         if len(pcm) < 64:
             return False
-        # Zero-crossing rate
         zcr = float(np.mean(np.abs(np.diff(np.sign(pcm)))) / 2)
-        # Spectral centroid
         fft_mag = np.abs(np.fft.rfft(pcm))
         freqs = np.fft.rfftfreq(len(pcm), d=1.0 / sample_rate)
         centroid = float(np.sum(freqs * fft_mag) / (np.sum(fft_mag) + 1e-9))
         return centroid > 4000 and zcr > 0.35
 
-    def _set_cooldown(self, seconds: float | None = None) -> None:
-        """Ignore mic input for a short period after assistant/system audio."""
-        self.cooldown_until = time.monotonic() + (seconds or self.cfg.assistant_audio_cooldown_s)
+    def save_debug_wav(self, samples, prefix="utterance") -> Optional[Path]:
+        if not self.cfg.debug_save_wav or not samples:
+            return None
+        out_dir = Path(self.cfg.debug_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{prefix}_{int(time.time() * 1000)}.wav"
+        with wave_open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.cfg.sample_rate)
+            wf.writeframes(np.concatenate(samples).astype(np.int16).tobytes())
+        log.debug("debug wav saved: %s", path)
+        self._last_debug_wav = path
+        return path
 
-    @staticmethod
-    def _make_earcon(
-        tones: list[tuple[float, float]],  # [(freq_hz, duration_s), ...]
-        samplerate: int,
-        amplitude: int = 13000,            # out of 32767; 13000 ≈ 40%
-        fade_ms: float = 5.0,              # ms for fade-in on first / fade-out on last tone
-    ) -> np.ndarray:
+    def _log_turn(self, turn_data: dict) -> None:
+        """One JSON line per turn in a daily JSONL file."""
+        log_dir = Path(self.cfg.turnlogdir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / f"turns_{time.strftime('%Y-%m-%d')}.jsonl", "a") as f:
+            f.write(json.dumps(turn_data) + "\n")
+
+    def _enqueue_utterance(self, utt: Utterance) -> None:
+        """Newest utterance wins: if one is still waiting unprocessed, replace it."""
+        self.turn_active.set()
+        while True:
+            try:
+                self.utterance_queue.put_nowait(utt)
+                return
+            except queue.Full:
+                try:
+                    old = self.utterance_queue.get_nowait()
+                    self._m_dropped += 1
+                    trace.emit("utterance_replaced", old_source=old.source)
+                    log.warning("replacing unprocessed utterance with newer one")
+                except queue.Empty:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Endpointing helpers
+    # ------------------------------------------------------------------
+    # A sentence cannot end on these: the speaker is mid-thought even if STT added a full stop.
+    _DANGLING = {"and", "or", "but", "because", "the", "a", "an", "to", "of", "with", "for", "my", "your",
+                 "if", "then", "like", "um", "uh", "from", "by"}
+    # Short follow-ups that really are questions when said over the assistant.
+    _SHORT_QUESTIONS = {"why", "what", "how", "who", "when", "where", "which", "really", "huh", "pardon",
+                        "again", "more", "sorry", "continue", "go on", "and", "so", "meaning", "explain"}
+    _DANGLING_UNLESS_QUESTION = {"about", "is", "are", "was", "that", "it", "this", "there"}
+
+    def _spec_transcribe(self, frames) -> Optional[STTResult]:
+        try:
+            return self.stt.transcribe_ex(frames, self.cfg.sample_rate)
+        except Exception as e:
+            log.debug("speculative STT failed: %s", e)
+            return None
+
+    def _endpoint_hold(self, cap: "Capture", silence_ms: float) -> float:
         """
-        Synthesise a multi-tone earcon from a list of (freq_hz, duration_s) pairs.
-        Each tone is a pure sine wave. The first tone gets a fade-in and the last
-        tone gets a fade-out (fade_ms each), so the earcon never clicks.
-        Returns an int16 numpy array ready for PyAudio output.
+        How long to wait in silence before declaring the utterance finished.
+        The transcript of what was said so far (speculative STT) tells us how patient to be:
+          bare wake phrase     → wait long for the actual request
+          ends like a sentence → answer sooner
+          trails off ("and…")  → they are probably still thinking, wait longer
         """
-        segments = []
-        fade_samples = int(samplerate * fade_ms / 1000)
-
-        for i, (freq, dur) in enumerate(tones):
-            n = int(samplerate * dur)
-            t = np.linspace(0, dur, n, endpoint=False)
-            wave = np.sin(2 * np.pi * freq * t)
-
-            if i == 0 and fade_samples > 0:                         # fade-in on first
-                wave[:fade_samples] *= np.linspace(0, 1, fade_samples)
-            if i == len(tones) - 1 and fade_samples > 0:            # fade-out on last
-                wave[-fade_samples:] *= np.linspace(1, 0, fade_samples)
-
-            segments.append(wave)
-
-        combined = np.concatenate(segments)
-        return (combined * amplitude).astype(np.int16)
-    
-    def _play_earcon(self, pcm: np.ndarray) -> None:
-        """Play a pre-baked earcon PCM array in a daemon thread (non-blocking)."""
-        def _play():
-            # use sounddevice to play the earcon in a non-blocking way
-            sd.play(pcm, samplerate=self.cfg.sample_rate, blocking=False)
-        threading.Thread(target=_play, daemon=True).start()
-
+        cfg = self.cfg
+        hold = float(cfg.utterance_silence_hold_ms)
+        spec = cap.spec
+        if spec is None:
+            return hold
+        if not spec.fut.done():
+            # Result pending: a wake-only capture must not end before we know it is wake-only.
+            return hold + 600.0 if cap.wakeish and silence_ms < hold + 600.0 else hold
+        try:
+            res = spec.fut.result()
+        except Exception:
+            return hold
+        raw = res.text if res is not None else None
+        if raw is None or tu.is_hallucination(raw):
+            # Right after the wake word the "speech" is often just a fragment of it that
+            # whisper cannot read: stay patient, the request is probably still coming.
+            return float(cfg.utterance_wake_hold_ms) if cap.wakeish else hold
+        text = tu.clean_transcript(raw)
+        core = tu.strip_wake_phrase(text, cfg.wakeword)
+        if not core:                      # nothing but the wake phrase so far
+            return float(cfg.utterance_wake_hold_ms)
+        words = core.lower().split()
+        last = words[-1].strip(".,?!;:") if words else ""
+        stripped = text.rstrip()
+        if stripped.endswith("?") and len(words) >= 1:
+            return float(cfg.utterance_early_hold_ms)
+        if stripped.endswith((",", "-", "…", "...")) or last in self._DANGLING:
+            return float(cfg.utterance_hesitation_hold_ms)
+        if last in self._DANGLING_UNLESS_QUESTION and not stripped.endswith((".", "!")):
+            return float(cfg.utterance_hesitation_hold_ms)
+        if stripped.endswith((".", "?", "!")) and len(words) >= 2:
+            return float(cfg.utterance_early_hold_ms)
+        return hold
 
     # ------------------------------------------------------------------
     # Thread 1: Audio
     # ------------------------------------------------------------------
-    def _audio_thread(self, stream) -> None:
-        """
-        Continuously reads mic frames.
-
-        Pre-wake: WebRTC gate → openWakeWord detection.
-        Post-wake: Silero utterance capture → enqueue for processing.
-        Interrupt: While T2 is speaking, monitor for sustained speech with
-        energy above threshold → signal T2 to cancel.
-        Conversation timeout: silence after TTS → back to idle.
-        """
-
-        # Per-utterance state.
-        after_wake = False
-        silence_frames = 0
-        command_start = None
-        silero_buf = np.zeros(0, dtype=np.int16)
-        recording = []
-        current_capture_from_conversation = False
-
-        # Pre-roll: capture audio just before wake word so the first syllable
-        # of the command is not clipped.
-        pre_roll_frames = max(
-            1,
-            int((self.cfg.utterance_pre_roll_ms / 1000) * self.cfg.sample_rate / self.webrtc.frame_samples),
-        )
-        pre_roll = deque(maxlen=pre_roll_frames)
-
-        # Post-roll: keep a little tail after final silence.
-        post_roll_frames = max(
-            1,
-            int((self.cfg.utterance_post_roll_ms / 1000) * self.cfg.sample_rate / self.webrtc.frame_samples),
-        )
-        post_roll_queue = deque(maxlen=post_roll_frames)
-
-        # Conversation-mode re-entry gating.
-        conversation_reentry_hits = 0
-
-        # Interrupt detection state.
-        interrupt_speech_ms = 0.0
-        interrupt_recording = []
-        interrupt_silero = SileroGate()
-        interrupt_silero_buf = np.zeros(0, dtype=np.int16)
-        interrupt_active = False
-
-        # Conversation timeout state.
-        warning_played = False
-
-        def reset_utterance_state() -> None:
-            nonlocal after_wake, silence_frames, command_start
-            nonlocal silero_buf, recording, current_capture_from_conversation
-            after_wake = False
-            silence_frames = 0
-            command_start = None
-            current_capture_from_conversation = False
-            self.silero.state = None
-            self.silero.started_at = None
-            self.silero.history = []
-            silero_buf = np.zeros(0, dtype=np.int16)
-            recording = []
-            post_roll_queue.clear()
-
-        def reset_interrupt_state() -> None:
-            nonlocal interrupt_speech_ms, interrupt_recording
-            nonlocal interrupt_silero_buf, interrupt_active
-            interrupt_speech_ms = 0.0
-            interrupt_recording = []
-            interrupt_silero_buf = np.zeros(0, dtype=np.int16)
-            interrupt_active = False
-            interrupt_silero.state = None
-            interrupt_silero.started_at = None
-            interrupt_silero.history = []
-
-        frame_duration_ms = (self.webrtc.frame_samples / self.cfg.sample_rate) * 1000
-
+    def _audio_thread(self) -> None:
+        """Supervisor: an unexpected exception in the audio loop must never leave the assistant deaf."""
+        failures = 0
         while self.running.is_set():
-            pcm   = stream.read(self.webrtc.frame_samples, exception_on_overflow=False)
-            t     = time.monotonic()
-            frame = np.frombuffer(pcm, dtype=np.int16)
+            t_start = time.monotonic()
+            try:
+                self._audio_loop()
+                return
+            except Exception as e:
+                if time.monotonic() - t_start > 60:
+                    failures = 0
+                failures += 1
+                log.exception("audio loop crashed (%d/5): %s", failures, e)
+                trace.emit("error", where="audio_loop", msg=str(e))
+                self.speaker.stop("audio_crash")
+                if failures >= 5:
+                    log.error("audio loop keeps failing — giving up")
+                    self._earcon("error")
+                    self._say("fallback_generic")
+                    self.running.clear()
+                    return
+                time.sleep(0.5)
 
-            # log RMS every frame (~30 ms). Cheap: single pass over frame.
-            _rms_now = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2))) / 32768.0
-            logger.amplitude(_rms_now)
+    def _audio_loop(self) -> None:
+        cfg = self.cfg
+        mic = self._mic
+        fs = self.webrtc.frame_samples
+        fms = fs / cfg.sample_rate * 1000.0
+        chunk = self.silero.chunk_size
+        chunk_ms = chunk / cfg.sample_rate * 1000.0
 
-            # Keep rolling pre-roll while idle.
-            if not after_wake:
-                pre_roll.append(frame)
+        pre_roll = deque(maxlen=max(1, int(max(cfg.utterance_pre_roll_ms, cfg.utterance_wake_pre_roll_ms) / fms)))
+        n_pre = max(1, int(cfg.utterance_pre_roll_ms / fms))
+        cap: Optional[Capture] = None
 
-            # Hard cooldown after assistant/system speech.
-            if t < self.cooldown_until:
-                continue
+        # wake word gating
+        ww_hang = 0
+        ww_prev_speech = False
+        # follow-up trigger
+        reentry_hits = 0
+        reentry_buf = np.zeros(0, dtype=np.int16)
+        reentry_probs: deque = deque(maxlen=5)
+        # barge-in detector
+        bi_frames: List[np.ndarray] = []
+        bi_speech_ms = 0.0
+        bi_buf = np.zeros(0, dtype=np.int16)
+        bi_session_start = None          # when the assistant became busy
+        playing_prev = False
+        play_start = 0.0
+        play_gap_t = 0.0
+        warned = False
+        webrtc_prev = None
+        noise_floor = 0.003            # slow estimate of the room's background RMS (quiet frames only)
 
-            # Conversation timeout only when truly idle.
-            if (
-                self.conversation_mode.is_set()
-                and not self.is_speaking.is_set()
-                and not self.processing_busy.is_set()
-                and not after_wake
-                and self._last_tts_end_time is not None
-            ):
-                silent_for = t - self._last_tts_end_time
-                timeout = self.cfg.conversation_timeout_s
-                warning_at = timeout - self.cfg.conversation_warning_s
+        def silero_reset():
+            self.silero.reset()
 
-                if not warning_played and silent_for >= warning_at:
-                    self._play_earcon(self.sleep_earcon_pcm)
-                    self.phrases.play("going_to_sleep")
-                    self._set_cooldown()
-                    warning_played = True
+        def start_capture(source: str, seed: List[np.ndarray], wake_score: float = 0.0) -> None:
+            nonlocal cap
+            silero_reset()
+            cap = Capture(source=source, t_start=time.monotonic(), wake_score=wake_score, wakeish=(source == "wake"))
+            self.wake.hits = 0
+            trace.emit("capture_start", source=source, seed_ms=round(len(seed) * fms))
+            for fr in seed:
+                feed_capture(fr)
 
-                if silent_for >= timeout:
-                    self._play_earcon(self.sleep_earcon_pcm)
-                    self.phrases.play("goodbye")
-                    self._set_cooldown()
-                    self.conversation_mode.clear()
-                    self._last_tts_end_time = None
-                    warning_played = False
-                    reset_utterance_state()
-                    print(f"[{stamp()}] Conversation timeout — returning to idle")
-                    continue
-
-            # Interrupt detection while assistant is speaking.
-            if self.is_speaking.is_set() and self.conversation_mode.is_set():
-                # append frame for interrupt detection
-                interrupt_recording.append(frame)
-                # Silero gate on the interrupt buffer to detect sustained speech.
-                interrupt_silero_buf = np.concatenate([interrupt_silero_buf, frame])
-
-                # while we have enough audio for Silero, check for sustained speech in the interrupt buffer
-                while len(interrupt_silero_buf) >= interrupt_silero.chunk_size:
-                    # use Silero to detect if there's sustained speech in the interrupt buffer
-                    chunk = interrupt_silero_buf[:interrupt_silero.chunk_size]
-                    # remove the chunk from the buffer so the next iteration checks the next chunk
-                    interrupt_silero_buf = interrupt_silero_buf[interrupt_silero.chunk_size:]
-                    # predict speech probability with Silero on the chunk
-                    prob = interrupt_silero.predict(chunk.tobytes())
-                    # update Silero state and get the new state
-                    _, new_state, _, _, _, _ = interrupt_silero.update(prob)
-
-                    # if Silero detects speech
-                    if new_state == "speech":
-                        # increment the interrupt speech duration with the chunk duration
-                        interrupt_speech_ms += frame_duration_ms
-                    # if Silero detects silence
-                    else:
-                        # Speech must be sustained, not sporadic.
-                        # Reset the interrupt speech duration and recording
-                        interrupt_speech_ms = 0.0
-                        # interrupt_recording = []
-
-                    # Fire interrupt only if:
-                    #   1. Sustained speech for interrupt_min_speech_ms
-                    #   2. RMS energy above threshold (filters hiss/breath noise)
-                    if interrupt_speech_ms >= self.cfg.interrupt_min_speech_ms:
-                        rms = self._rms(interrupt_recording)
-                        if rms >= self.cfg.interrupt_energy_threshold and not interrupt_active \
-                                and not (self.cfg.interrupt_hiss_filter \
-                                    and self._is_breath_or_hiss(list(interrupt_recording), self.cfg.sample_rate) \
-                                ):
-                            interrupt_active = True
-                            self._viz_log(
-                                f"[{stamp()}] Interrupt detected (rms={rms:.4f}) — switching to listen mode",
-                                rms=rms,
-                                phase="INTERRUPT",
-                            )
-                            # Signal T2 to stop TTS (cancel_event), but do NOT
-                            # put the short interrupt_recording into the queue.
-                            # Instead, drop back into the normal post-wake capture
-                            # path so the user's full utterance is recorded via
-                            # the Silero silence-gate, just like after a wake word.
-                            self._m_interrupt_detected += 1
-                            self.cancel_event.set()
-                            logger.interrupt(rms)
-                            # Capture interrupt_recording NOW before reset clears it.
-                            # This is the audio T1 has been accumulating during TTS —
-                            # it contains the user's first words ("one, two...").
-                            captured_so_far = list(interrupt_recording)
-                            reset_interrupt_state()            # clears interrupt_recording
-
-                            # Re-enter post-wake listening mode
-                            after_wake = True
-                            current_capture_from_conversation = True
-                            command_start = t
-                            silero_buf = np.zeros(0, dtype=np.int16)
-                            silence_frames = 0
-                            self.silero.state = None
-                            self.silero.started_at = None
-                            self.silero.history = []
-                            # Seed with captured interrupt audio, NOT stale pre_roll.
-                            recording = captured_so_far
-                            post_roll_queue = deque(maxlen=post_roll_frames)
-                            warning_played = False
-                            # Play earcon in background — don't block T1.
-                            threading.Thread(
-                                target=lambda: self._play_earcon(self.listening_earcon_pcm),
-                                daemon=True
-                            ).start()
-                        elif rms < self.cfg.interrupt_energy_threshold:
-                            reset_interrupt_state()
-
-                continue
-
-            # Reset interrupt state when not speaking.
-            reset_interrupt_state()
-
-            # Pre-wake path.
-            if not after_wake and not self.conversation_mode.is_set():
-                is_speech = self.webrtc.vad.is_speech(pcm, self.webrtc.sample_rate)
-                new_webrtc_state = "speech" if is_speech else "silence"
-
-                if self.webrtc.state is None:
-                    self.webrtc.state = new_webrtc_state
-                    self.webrtc.started_at = t
-                    self._viz_log(
-                        f"[{stamp()}] WebRTC {new_webrtc_state} (start)",
-                        webrtc_state=new_webrtc_state,
-                        phase="PRE-WAKE",
-                    )
-                elif new_webrtc_state != self.webrtc.state:
-                    old = self.webrtc.state
-                    self._viz_log(
-                        f"[{stamp()}] WebRTC {old} -> {new_webrtc_state} "
-                        f"after {t - self.webrtc.started_at:.2f}s",
-                        webrtc_state=new_webrtc_state,
-                        phase="PRE-WAKE",
-                    )
-                    self.webrtc.state = new_webrtc_state
-                    self.webrtc.started_at = t
-
-                if self.webrtc.state != "speech":
-                    continue
-
-                score = self.wake.model.predict(frame).get(self.cfg.wakeword, 0.0)
-                self.wake.hits = (self.wake.hits + 1) if score >= self.wake.threshold else 0
-
+        def feed_capture(fr: np.ndarray) -> None:
+            """Advance the capture by one 30 ms frame (Silero → speech accounting)."""
+            c = cap
+            c.frames.append(fr)
+            c.ms += fms
+            c.sbuf = np.concatenate([c.sbuf, fr])
+            if c.source == "followup" and not c.wakeish:
+                # The wake phrase also works while the conversation is open: it changes how
+                # patient we are afterwards ("Hey Jarvis … [pause] … question").
+                sc = self.wake.model.predict(fr).get(cfg.wakeword, 0.0)
+                self.wake.hits = (self.wake.hits + 1) if sc >= self.wake.threshold else 0
                 if self.wake.hits >= self.wake.trigger_level:
                     self.wake.hits = 0
-                    after_wake = True
-                    current_capture_from_conversation = False
-                    command_start = t
-                    silero_buf = np.zeros(0, dtype=np.int16)
-                    silence_frames = 0
-                    self.silero.state = None
-                    self.silero.started_at = None
-                    self.silero.history = []
-                    recording = list(pre_roll)
-                    post_roll_queue = deque(maxlen=post_roll_frames)
-                    self.conversation_mode.set()
-                    warning_played = False
-                    logger.wakeword(score)
-                    self._viz_log(
-                        f"[{stamp()}] WakeWord detected: {self.cfg.wakeword} score={score:.3f}",
-                        rms=self._rms([frame]),
-                        phase="WAKE",
-                    )
-                    threading.Thread(
-                        target=lambda: (
-                            self._play_earcon(self.wake_earcon_pcm),
-                            self.phrases.play("listening"),
-                            self._set_cooldown()
-                        ),
-                        daemon=True
-                    ).start()
+                    c.wakeish = True
+                    trace.emit("wake", score=round(float(sc), 3), during="followup")
+                    log.info("wake phrase heard during follow-up capture (score=%.2f)", sc)
+            while len(c.sbuf) >= chunk:
+                part, c.sbuf = c.sbuf[:chunk], c.sbuf[chunk:]
+                prob = self.silero.predict(part.tobytes())
+                changed, new_state, old_state, avg, started, t2 = self.silero.update(prob)
+                if new_state == "speech":
+                    c.speech_ms += chunk_ms
+                    c.last_speech_ms = c.ms
+                    c.heard = True
+                    c.speech_sq += float(np.mean((part.astype(np.float32) / 32768.0) ** 2))
+                    c.speech_frames += 1
+                if changed:
+                    log.debug("silero %s→%s avg=%.2f t=%.0fms speech=%.0fms", old_state, new_state, avg, c.ms, c.speech_ms)
+
+        def finish_capture(reason: str) -> None:
+            nonlocal cap, warned
+            c = cap
+            cap = None
+            silence_ms = c.ms - c.last_speech_ms if c.heard else c.ms
+            # Trim trailing silence down to post-roll.
+            trim = max(0, int((silence_ms - cfg.utterance_post_roll_ms) / fms))
+            frames = c.frames[: len(c.frames) - trim] if trim < len(c.frames) else c.frames
+            rms = self._rms(frames)
+            accepted = (reason in ("silence", "max")
+                        and c.speech_ms >= cfg.utterance_min_speech_ms
+                        and rms >= cfg.utterance_reject_rms)
+            t_eos = time.monotonic() - silence_ms / 1000.0
+            trace.emit("capture_end", source=c.source, reason=reason, accepted=accepted,
+                       dur_ms=round(c.ms), speech_ms=round(c.speech_ms), rms=round(rms, 4),
+                       silence_ms=round(silence_ms))
+            logger.utterance_accepted(rms) if accepted else logger.utterance_rejected(rms)
+            if not accepted:
+                self._m_false_wakes += 1
+                log.info("capture rejected (%s, %s): %.0fms audio, %.0fms speech, rms=%.4f",
+                         c.source, reason, c.ms, c.speech_ms, rms)
+                if c.source == "wake":
+                    # Woke up but nobody spoke: say nothing more, go back to sleep quietly.
+                    self.conversation_mode.clear()
+                    self._user_level = None
+                    self._earcon("interrupt")
+                    trace.emit("sleep", why="wake_without_speech")
+                else:
+                    self.last_activity = time.monotonic()
+                return
+            self.save_debug_wav(frames)
+            warned = False
+            self.last_activity = time.monotonic()
+            log.info("utterance accepted (%s): %.0fms, speech %.0fms, rms=%.4f", c.source, c.ms, c.speech_ms, rms)
+            if c.speech_frames:
+                lvl = (c.speech_sq / c.speech_frames) ** 0.5
+                self._user_level = lvl if self._user_level is None else 0.5 * self._user_level + 0.5 * lvl
+            utt = Utterance(frames, c.source, c.speech_ms, rms, t_eos, time.monotonic(), c.wake_score,
+                            stt_future=c.spec.fut if c.spec else None)
+            if c.source == "interject":
+                threading.Thread(target=self._confirm_interject, args=(utt,), name="Interject", daemon=True).start()
+                return
+            if cfg.ack_earcon_enabled:
+                self._earcon("ack")
+            self._enqueue_utterance(utt)
+
+        def reset_barge():
+            nonlocal bi_frames, bi_speech_ms, bi_buf
+            bi_frames, bi_speech_ms, bi_buf = [], 0.0, np.zeros(0, dtype=np.int16)
+
+        frames_read = 0
+        # Mic sample clock for the echo canceller: block k ended at mic_t0 + (k+1)*fms. Using the
+        # wall-clock time at which read() returned would jitter by tens of ms (a late loop returns
+        # buffered data) and wreck the delay alignment between mic and loudspeaker reference.
+        mic_t0 = None
+        lag_hist: deque = deque(maxlen=150)
+        while self.running.is_set():
+            pcm = mic.read(fs)
+            if not self.running.is_set():
+                break
+            t = time.monotonic()
+            frame = np.frombuffer(pcm, dtype=np.int16)
+            if len(frame) < fs:
+                continue
+            raw_rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2))) / 32768.0
+            if self.aec is not None:
+                if mic_t0 is None:
+                    mic_t0 = t - fms / 1000.0
+                t_nominal = mic_t0 + (frames_read + 1) * fms / 1000.0
+                lag_hist.append(t - t_nominal)
+                if frames_read % 100 == 99:               # follow slow clock drift / start-up latency
+                    m = min(lag_hist)
+                    if abs(m) > 0.004:
+                        mic_t0 += m
+                frame = self.aec.process(frame, t_nominal)  # subtract our own loudspeaker output
+                pcm = frame.tobytes()
+                if self.aec.active and frames_read % 33 == 0:
+                    trace.emit("aec", erle_db=round(self.aec.erle_db, 1), converged=self.aec.converged,
+                               resets=self.aec.resets, blocks=self.aec.trained_blocks,
+                               mic_rms=round(raw_rms, 4),
+                               out_rms=round(float(np.sqrt(np.mean(frame.astype(np.float32) ** 2))) / 32768.0, 4))
+            frames_read += 1
+            rms_now = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2))) / 32768.0
+            logger.amplitude(rms_now)
+            pre_roll.append(frame)
+
+            awake = self.conversation_mode.is_set()
+            sp = self.speaker
+            sp_kind = sp.active_kind()
+            sp_active = sp.is_active()
+            busy = self.turn_active.is_set() or sp_active
+
+            # ── 1. capturing an utterance ─────────────────────────────────
+            if cap is not None:
+                feed_capture(frame)
+                silence_ms = cap.ms - cap.last_speech_ms if cap.heard else cap.ms
+                if cap.ms >= cfg.utterance_max_ms:
+                    finish_capture("max")
                     continue
-
-            # Conversation-mode re-entry.
-            if not after_wake and self.conversation_mode.is_set():
-                # Prevent immediate re-trigger if we're still processing or speaking the previous turn.
-                if self.processing_busy.is_set() or self.is_speaking.is_set():
+                if cap.speech_ms < cfg.utterance_min_speech_ms:
+                    if cap.ms >= cfg.utterance_noise_abort_ms + (1500 if cap.source == "wake" else 0):
+                        finish_capture("no_speech")
                     continue
-
-                # Require sustained speech with WebRTC to re-enter, to avoid noise-triggered false wakes.
-                is_speech = self.webrtc.vad.is_speech(pcm, self.webrtc.sample_rate)
-                if not is_speech:
-                    conversation_reentry_hits = 0
-                    continue
-
-                # Note: we intentionally do not use Silero for conversation re-entry gating, to keep it 
-                # more responsive and less likely to get stuck in silence if Silero misses the start of speech.
-                conversation_reentry_hits += 1
-                if conversation_reentry_hits < self.cfg.conversation_reentry_start_hits:
-                    continue
-
-                after_wake = True
-                current_capture_from_conversation = True
-                command_start = t
-                silero_buf = np.zeros(0, dtype=np.int16)
-                silence_frames = 0
-                self.silero.state = None
-                self.silero.started_at = None
-                self.silero.history = []
-                recording = list(pre_roll)
-                post_roll_queue = deque(maxlen=post_roll_frames)
-                conversation_reentry_hits = 0
-                self._play_earcon(self.listening_earcon_pcm)
-
-            if not after_wake:
+                # Speculative STT: transcribe while the silence hold is still running.
+                if cap.spec is not None and cap.spec.last_speech_ms != cap.last_speech_ms:
+                    cap.spec = None                 # user resumed talking → stale
+                if (cap.spec is None and silence_ms >= cfg.speculative_stt_ms and cap.source != "interject"
+                        and self._stt_pool is not None):
+                    # Exactly the audio finish_capture() would send (speech + post-roll of silence),
+                    # so the speculative transcript is the transcript of the final utterance.
+                    trim = max(0, int((silence_ms - cfg.utterance_post_roll_ms) / fms))
+                    snap = list(cap.frames[: len(cap.frames) - trim]) if trim < len(cap.frames) else list(cap.frames)
+                    cap.spec = Spec(self._stt_pool.submit(self._spec_transcribe, snap), cap.last_speech_ms)
+                hold = self._endpoint_hold(cap, silence_ms)
+                if silence_ms >= hold:
+                    finish_capture("silence")
                 continue
 
-            recording.append(frame)
-            post_roll_queue.append(frame)
-            silero_buf = np.concatenate([silero_buf, frame])
-
-            while len(silero_buf) >= self.silero.chunk_size:
-                chunk      = silero_buf[:self.silero.chunk_size]
-                silero_buf = silero_buf[self.silero.chunk_size:]
-                prob       = self.silero.predict(chunk.tobytes())
-                changed, new_state, old_state, avg, started, t2 = self.silero.update(prob)
-
-                if changed:
-                    elapsed = (t - command_start) * 1000 if command_start else 0.0
-                    if old_state is None:
-                        self._viz_log(
-                            f"[{stamp()}] Silero {new_state} (start) avg={avg:.3f}",
-                            rms=self._rms([recording[-1]]) if recording else None,
-                            silero_prob=prob,
-                            webrtc_state=self.webrtc.state,
-                            phase="LISTENING",
-                            elapsed_ms=elapsed,
-                        )
+            # ── 2. assistant is busy: watch for barge-in ──────────────────
+            if awake and busy:
+                if sp_kind == "earcon":
+                    continue                      # ignore the beeps themselves
+                if bi_session_start is None:
+                    bi_session_start = t
+                    reset_barge()
+                level = sp.recent_level()
+                # Calibration window: the first ~0.45 s after our audio (re)starts being audible.
+                # We learn the speaker→mic coupling there and never barge-in on it.
+                if level > 0.02:
+                    if not playing_prev:
+                        play_start = t
+                    playing_prev = True
+                    play_gap_t = t
+                elif playing_prev and t - play_gap_t > 0.4:
+                    playing_prev = False
+                in_calibration = playing_prev and (t - play_start) < 0.45
+                # Learn how loudly our own playback leaks into the mic.
+                if level > 0.02 and bi_speech_ms == 0.0:
+                    sample = rms_now / level
+                    if in_calibration or sample < self._echo_ratio:
+                        self._echo_ratio = 0.7 * self._echo_ratio + 0.3 * sample
                     else:
-                        self._viz_log(
-                            f"[{stamp()}] Silero {old_state} -> {new_state} "
-                            f"after {t2 - started:.2f}s avg={avg:.3f}",
-                            rms=self._rms([recording[-1]]) if recording else None,
-                            silero_prob=prob,
-                            webrtc_state=self.webrtc.state,
-                            phase="LISTENING",
-                            elapsed_ms=elapsed,
-                        )
+                        self._echo_ratio = 0.995 * self._echo_ratio + 0.005 * sample
+                if level > 0.02 and in_calibration:
+                    continue            # still learning how loud our own voice is at the mic
 
-                silence_frames = (
-                    silence_frames + 1 if self.silero.state == "silence" else 0
-                )
+                # Until the echo canceller has converged, demand a larger margin over the learned echo.
+                cautious = (self.aec is not None and not self.aec.converged and self._echo_ratio > 0.03)
+                margin = cfg.interrupt_echo_margin * (1.6 if cautious else 1.0)
+                echo_floor = self._echo_ratio * level * margin
+                loud_enough = rms_now >= max(cfg.interrupt_energy_threshold, 2.5 * noise_floor, echo_floor)
 
-                command_age_ms = (t - command_start) * 1000 if command_start else 0
-                enough_silence = silence_frames >= self.cfg.silero_stop_silence_frames
-                enough_time    = command_age_ms >= self.cfg.utterance_min_ms
-                past_floor     = command_age_ms >= self.cfg.utterance_floor_ms
-                very_silent    = avg < self.cfg.silero_early_exit_threshold
-
-                # Early exit is allowed only for the first wake-triggered utterance,
-                # not for conversation-mode re-entry captures.
-                early_exit = (
-                    past_floor
-                    and very_silent
-                    and enough_silence
-                    and not current_capture_from_conversation
-                )
-
-                if (enough_time and enough_silence) or early_exit:
-                    if early_exit and not enough_time:
-                        self._viz_log(
-                            f"[{stamp()}] Early exit at {command_age_ms:.0f}ms (avg={avg:.3f})",
-                            rms=self._rms(recording) if recording else None,
-                            silero_prob=avg,
-                            phase="LISTENING",
-                            elapsed_ms=command_age_ms,
-                        )
+                bi_buf = np.concatenate([bi_buf, frame])
+                bi_frames.append(frame)
+                if len(bi_frames) > int(1500 / fms):
+                    bi_frames = bi_frames[-int(1500 / fms):]
+                # Raw per-chunk Silero probability (not the 5-chunk smoothed state): a one-word
+                # command like "stop" is only ~8 chunks long and must be recognised in time.
+                while len(bi_buf) >= chunk:
+                    part, bi_buf = bi_buf[:chunk], bi_buf[chunk:]
+                    prob = self.silero.predict(part.tobytes())
+                    self.silero.history.append(prob)            # keep Silero's smoothing state coherent
+                    if len(self.silero.history) > self.silero.history_max:
+                        self.silero.history.pop(0)
+                    if prob >= cfg.silero_threshold and loud_enough:
+                        bi_speech_ms += chunk_ms
                     else:
-                        self._viz_log(
-                            f"[{stamp()}] Utterance ended",
-                            rms=self._rms(recording) if recording else None,
-                            silero_prob=avg,
-                            phase="LISTENING",
-                            elapsed_ms=command_age_ms,
-                        )
+                        bi_speech_ms = max(0.0, bi_speech_ms - chunk_ms * 1.5)
+                        if bi_speech_ms == 0.0 and len(bi_frames) > int(600 / fms):
+                            bi_frames = bi_frames[-int(300 / fms):]
 
-                    samples = recording + list(post_roll_queue)
-                    self.save_debug_wav(samples)
+                # Immediate feedback: as soon as someone seems to be talking, turn our own voice down
+                # (also cuts the echo we feed back into the mic). Restored if it was a false alarm.
+                if cfg.barge_in_duck_gain < 1.0:
+                    sp.set_duck(cfg.barge_in_duck_gain if bi_speech_ms >= cfg.barge_in_duck_after_ms else 1.0)
 
-                    # Tiny, low-energy captures are almost always noise.
-                    # Drop them quietly instead of saying "please wait".
-                    capture_rms = self._rms(samples)
-                    if command_age_ms < self.cfg.utterance_reject_ms or capture_rms < self.cfg.utterance_reject_rms:
-                        self._viz_log(
-                            f"[{stamp()}] REJECTED Utterance"
-                            f"(age={command_age_ms:.0f}ms rms={capture_rms:.4f})",
-                            rms=capture_rms,
-                            silero_prob=avg,
-                            phase="LISTENING",
-                            elapsed_ms=command_age_ms,
-                        )
-                        logger.utterance_rejected(_rms_now)
-                        # A wake fired but the capture was too short/quiet — count as false wake.
-                        self._m_false_wakes += 1
-                        # Log a summary every N false wakes to help tune thresholds.
-                        interval = self.cfg.false_wake_log_interval
-                        if interval > 0 and self._m_false_wakes % interval == 0:
-                            print(
-                                f"[false-wake summary] total={self._m_false_wakes} "
-                                f"| cooldown={self.cfg.assistant_audio_cooldown_s}s "
-                                f"| reentry_hits={self.cfg.conversation_reentry_start_hits} "
-                                f"| interrupt_min_speech={self.cfg.interrupt_min_speech_ms}ms"
-                            )
-                        reset_utterance_state()
-                        break
-                    else:
-                        self._viz_log(
-                            f"[{stamp()}] ACCEPTED Utterance"
-                            f"(age={command_age_ms:.0f}ms rms={capture_rms:.4f})",
-                            rms=capture_rms,
-                            silero_prob=avg,
-                            phase="LISTENING",
-                            elapsed_ms=command_age_ms,
-                        )
-                        logger.utterance_accepted(_rms_now)
+                if bi_speech_ms >= cfg.interrupt_min_speech_ms * (2 if cautious and level > 0.02 else 1):
+                    rms = self._rms(bi_frames[-int(bi_speech_ms / fms):])
+                    if cfg.interrupt_hiss_filter and self._is_breath_or_hiss(list(bi_frames), cfg.sample_rate):
+                        reset_barge()
+                        continue
+                    self._m_interrupt_detected += 1
+                    logger.interrupt(rms)
+                    trace.emit("barge_in", rms=round(rms, 4), speech_ms=round(bi_speech_ms),
+                               echo_floor=round(echo_floor, 4), speaker_kind=sp_kind,
+                               turn_active=self.turn_active.is_set(),
+                               erle_db=round(self.aec.erle_db, 1) if self.aec else None,
+                               mode="stop" if sp_kind == "tts" else "interject")
+                    log.info("BARGE-IN (rms=%.4f, speaker=%s, mode=%s)", rms, sp_kind,
+                             "stop" if sp_kind == "tts" else "interject")
+                    seed = list(bi_frames)
+                    sp.set_duck(1.0)
+                    # Talking over actual answer audio → stop it now. Over silence/filler
+                    # ("thinking" phase) → only record; STT must confirm real speech
+                    # before the pending answer is cancelled (a cough must not kill it).
+                    mode = "stop" if sp_kind == "tts" else "interject"
+                    if mode == "stop":
+                        sp.stop("barge_in")
+                    reset_barge()
+                    bi_session_start = None
+                    warned = False
+                    start_capture("barge" if mode == "stop" else "interject", seed)
+                continue
+            bi_session_start = None
+            playing_prev = False
+            if bi_frames or bi_speech_ms:
+                reset_barge()
+                self.speaker.set_duck(1.0)
 
-                    try:
-                        self.utterance_queue.put_nowait(samples)
-                    except queue.Full:
-                        # T2 still processing previous turn — this utterance is lost.
-                        self._m_dropped += 1
-                        print(f"[{stamp()}] Utterance dropped — T2 still busy")
-                        self.phrases.play("please_wait")
-                        self._set_cooldown()
+            # ── 3. post-playback guard (speaker tail / room reverb) ───────
+            if sp_kind == "calib":
+                lvl = sp.recent_level()
+                if lvl > 0.01:
+                    self._echo_ratio = 0.9 * self._echo_ratio + 0.1 * (rms_now / lvl)
+            if sp_active or t < sp.last_end + cfg.assistant_audio_cooldown_s:
+                reentry_hits = 0
+                ww_hang = 0
+                continue
 
-                    reset_utterance_state()
+            # ── 4. AWAKE and quiet: follow-up speech or inactivity timeout ─
+            if awake:
+                is_speech = self.webrtc.vad.is_speech(pcm, self.webrtc.sample_rate)
+                if not is_speech:
+                    noise_floor = 0.995 * noise_floor + 0.005 * min(rms_now, 0.05)
+                trigger_rms = max(cfg.conversation_reentry_rms, 2.5 * noise_floor)
+                if self._user_level:
+                    # Ignore anything much quieter than the user's own voice (TV, other rooms).
+                    trigger_rms = max(trigger_rms, cfg.followup_level_ratio * self._user_level)
+                if is_speech and rms_now >= trigger_rms:
+                    reentry_hits += 1
+                    # Confirm with Silero so door slams / claps / chair noises don't open a capture.
+                    reentry_buf = np.concatenate([reentry_buf, frame])
+                    while len(reentry_buf) >= chunk:
+                        part, reentry_buf = reentry_buf[:chunk], reentry_buf[chunk:]
+                        reentry_probs.append(self.silero.predict(part.tobytes()))
+                else:
+                    reentry_hits = max(0, reentry_hits - 1) if is_speech else 0
+                    if reentry_hits == 0:
+                        reentry_probs.clear()
+                        reentry_buf = np.zeros(0, dtype=np.int16)
+                if (reentry_hits >= cfg.conversation_reentry_start_hits and len(reentry_probs) >= 3
+                        and sum(reentry_probs) / len(reentry_probs) >= cfg.silero_threshold):
+                    reentry_hits = 0
+                    reentry_probs.clear()
+                    reentry_buf = np.zeros(0, dtype=np.int16)
+                    self.last_activity = t
+                    warned = False
+                    start_capture("followup", list(pre_roll)[-n_pre:])
+                    continue
+                elif reentry_hits >= cfg.conversation_reentry_start_hits + 8:
+                    reentry_hits = 0                      # loud but not speech-like: keep ignoring
+
+                idle_s = t - self.last_activity
+                if not warned and idle_s >= cfg.conversation_timeout_s - cfg.conversation_warning_s:
+                    warned = True
+                    trace.emit("sleep_warning", idle_s=round(idle_s, 1))
+                    self._say("going_to_sleep")
+                if idle_s >= cfg.conversation_timeout_s:
+                    self.conversation_mode.clear()
+                    warned = False
+                    self._user_level = None
+                    trace.emit("sleep", why="timeout", idle_s=round(idle_s, 1))
+                    log.info("conversation timeout after %.0fs → idle", idle_s)
+                    self._earcon("sleep")
+                    self._say("goodbye")
+                continue
+
+            # ── 5. IDLE: WebRTC gate → wake word ──────────────────────────
+            is_speech = self.webrtc.vad.is_speech(pcm, self.webrtc.sample_rate)
+            if not is_speech:
+                noise_floor = 0.995 * noise_floor + 0.005 * min(rms_now, 0.05)
+            state = "speech" if is_speech else "silence"
+            if state != webrtc_prev:
+                logger.webrtc(is_speech)
+                webrtc_prev = state
+                self.webrtc.state = state
+            if is_speech:
+                ww_hang = 12
+            elif ww_hang > 0:
+                ww_hang -= 1
+            else:
+                ww_prev_speech = False
+                continue
+
+            frames_to_score = [frame]
+            if not ww_prev_speech:
+                # Speech just began: also give the model the lead-in it would otherwise miss.
+                frames_to_score = list(pre_roll)[-6:]
+                ww_prev_speech = True
+            for wf in frames_to_score:
+                score = self.wake.model.predict(wf).get(cfg.wakeword, 0.0)
+                self.wake.hits = (self.wake.hits + 1) if score >= self.wake.threshold else 0
+                if self.wake.hits >= self.wake.trigger_level:
                     break
+            if self.wake.hits >= self.wake.trigger_level:
+                self.wake.hits = 0
+                try:
+                    self.wake.model.reset()
+                except Exception:
+                    pass
+                ww_prev_speech = False
+                ww_hang = 0
+                self.conversation_mode.set()
+                self.last_activity = t
+                warned = False
+                logger.wakeword(score)
+                trace.emit("wake", score=round(float(score), 3))
+                log.info("WAKE WORD '%s' score=%.2f → AWAKE", cfg.wakeword, score)
+                self._earcon("wake")
+                start_capture("wake", list(pre_roll), wake_score=float(score))
 
     # ------------------------------------------------------------------
     # Thread 2: Processing
     # ------------------------------------------------------------------
     def _processing_thread(self) -> None:
-        """
-        Waits for utterances from T1, runs STT → LLM → TTS.
-        Checks cancel_event between TTS sentences.
-        On cancel: stops TTS, picks up interrupt from interrupt_queue,
-        builds combined transcript, reruns LLM.
-        """
-
-        def _transcribe_samples(samples) -> str | None:
-            """
-            Run STT. Returns clean transcript string, or None if blank/noise.
-            Blank audio is ignored quietly to avoid a speech loop.
-            """
-            try:
-                transcript = self.stt.transcribe(samples, self.cfg.sample_rate)
-            except Exception as e:
-                print(f"[{stamp()}] STT error: {e}")
-                return None
-
-            print(f"[{stamp()}] Transcript: {transcript}")
-
-            if (not transcript) or (not transcript.strip()) or (transcript.strip() in BLANK_TOKENS) \
-                or (len(transcript.strip()) < 2):
-                return None
-
-            return transcript.strip()        
-
-        def _run_llm(user_text: str) -> str | None:
-            """
-            Play 'thinking', call LLM with history.
-            Returns response or None."""
-            threading.Thread(
-                target=lambda: (
-                    self._play_earcon(self.thinking_earcon_pcm),
-                    self.phrases.play("thinking"),
-                    self._set_cooldown()
-                ),
-                daemon=True
-            ).start()
-            try:
-                logger.llm_start()
-                response = self.llm.generate(
-                    user_text,
-                    history=list(self.history)[:-1],
-                )
-                logger.llm_result()
-                print(f"[{stamp()}] LLM: {response}")
-                return response
-            except Exception as e:
-                print(f"[{stamp()}] LLM error: {e}")
-                return None
-
-        def _speak_with_cancel(response: str) -> bool:
-            """
-            Play response sentence by sentence.
-            Checks cancel_event before each sentence and between playback chunks.
-            Returns True if playback completed, False if cancelled.
-            """
-            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", response) if s.strip()]
-            if not sentences:
-                sentences = [response]
-
-            pa = pyaudio.PyAudio()
-            stream = None
-
-            try:
-                for i, sentence in enumerate(sentences):
-                    # Stop before synthesis if interrupt already happened.
-                    if self.cancel_event.is_set():
-                        print(f"[{stamp()}] TTS cancelled before sentence: {sentence[:40]}")
-                        return False
-
-                    wav = self.tts._synthesize(sentence)
-                    if wav is None:
-                        # TTS failed to synthesize this sentence.
-                        try:
-                            self._play_earcon(self.error_earcon_pcm)
-                            self.phrases.play("fallback_tts")
-                            self._set_cooldown()
-                        except Exception as e:
-                            print(f"[{stamp()}] TTS fallback phrase failed: {e}")
-                        return False
-
-                    # Stop if interrupt happened during synth HTTP call.
-                    if self.cancel_event.is_set():
-                        print(f"[{stamp()}] TTS cancelled after synthesis: {sentence[:40]}")
-                        return False
-
-                    buf = io.BytesIO(wav)
-                    audio_data, sample_rate = sf.read(buf, dtype="float32")
-
-                    # Handle mono/stereo safely.
-                    if getattr(audio_data, "ndim", 1) > 1:
-                        channels = audio_data.shape[1]
-                    else:
-                        channels = 1
-
-                    pcm = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
-
-                    # Open stream once, reuse for all sentences.
-                    if stream is None:
-                        stream = pa.open(
-                            format=pyaudio.paInt16,
-                            channels=channels,
-                            rate=sample_rate,
-                            output=True,
-                            frames_per_buffer=1024,
-                        )
-
-                    chunk_size = 1024
-                    offset = 0
-                    _FADE_CHUNKS = 4   # ~100 ms of fade at 1024 frames/16 kHz
-                    _fade_count  = 0
-
-                    while offset < len(pcm):
-                        end   = min(offset + chunk_size, len(pcm))
-                        chunk = pcm[offset:end].copy()
-
-                        if self.cancel_event.is_set():
-                            if _fade_count >= _FADE_CHUNKS:
-                                stream.stop_stream()
-                                print(f"[{stamp()}] TTS faded out mid-sentence")
-                                return False
-                            # Linear fade-out so the cut isn't a hard click.
-                            fade = np.linspace(1.0, 0.0, len(chunk),
-                                               dtype=np.float32)
-                            chunk = (chunk.astype(np.float32) * fade
-                                     ).astype(np.int16)
-                            _fade_count += 1
-
-                        stream.write(chunk.tobytes())
-                        offset = end
-
-                    print(f"[{stamp()}] TTS streamed: {sentence[:60]}...")
-
-                    # Small natural pause between sentences.
-                    if i < len(sentences) - 1:
-                        time.sleep(0.05)
-
-                return True
-
-            finally:
-                if stream is not None:
-                    try:
-                        # On normal completion, do not call stop_stream().
-                        # Close lets the playback drain cleanly.
-                        stream.close()
-                    except Exception as e:
-                        print(f"[{stamp()}] TTS stream close error: {e}")
-
-                try:
-                    pa.terminate()
-                except Exception as e:
-                    print(f"[{stamp()}] TTS terminate error: {e}")
-
         while self.running.is_set():
             try:
-                samples = self.utterance_queue.get(timeout=0.5)
-                self._tracer.reset(); self._tracer.mark("dequeue")
+                utt = self.utterance_queue.get(timeout=0.4)
             except queue.Empty:
                 continue
+            self.turn_active.set()
+            try:
+                self._run_turn(utt)
+            except Exception as e:  # never let one bad turn kill the assistant
+                log.exception("turn crashed: %s", e)
+                trace.emit("error", where="turn", msg=str(e))
+                logger.error(str(e))
+                self.speaker.stop("turn_crash")
+                self._earcon("error")
+                self._say("fallback_generic")
+            finally:
+                self.last_activity = time.monotonic()
+                if self.utterance_queue.empty():
+                    self.turn_active.clear()
 
-            self.processing_busy.set()
+    def _confirm_interject(self, utt: Utterance) -> None:
+        """User spoke while the assistant was still thinking. Only if STT hears real
+        speech do we cancel the pending answer and treat this as the next request."""
+        try:
+            res = self.stt.transcribe_ex(utt.samples, self.cfg.sample_rate)
+        except Exception as e:
+            log.warning("interjection STT failed: %s", e)
+            return
+        raw = res.text
+        if tu.is_hallucination(raw) or not tu.clean_transcript(raw or "") or (
+                not res.confident(self.cfg.stt_min_logprob)
+                and tu.classify_intent(tu.strip_wake_phrase(raw or ""), barge=True) is None):
+            trace.emit("interject_rejected", raw=(raw or "")[:60])
+            log.info("interjection was noise (%r) — keeping the pending answer", raw)
+            return
+        utt.text, utt.stt = raw, res
+        trace.emit("interject_confirmed", text=raw[:80])
+        log.info("interjection confirmed: %r → cancelling current turn", raw)
+        self.speaker.stop("interject")
+        self._enqueue_utterance(utt)
 
-            self._last_debug_wav = None   # reset at start of each new turn
+    def _get_transcript(self, utt: Utterance) -> STTResult:
+        if utt.text is not None:
+            return utt.stt or STTResult(utt.text)
+        if utt.stt_future is not None:
+            try:
+                res = utt.stt_future.result(timeout=30)
+                if res is not None:
+                    trace.emit("stt_speculative_used")
+                    return res
+            except Exception:
+                pass
+        return self._transcribe(utt)
 
-            # ── Turn start timestamp ──────────────────────────────────────────
-            # Monotonic clock: unaffected by system clock adjustments.
-            _turn_start = time.monotonic()
-            self._m_turns += 1
+    # -- STT -------------------------------------------------------------
+    def _transcribe(self, utt: Utterance) -> STTResult:
+        """Fresh transcription; raises on server failure."""
+        logger.stt_start()
+        res = self.stt.transcribe_ex(utt.samples, self.cfg.sample_rate)
+        logger.stt_result(res.text or "")
+        return res
 
-            # ── STT ───────────────────────────────────────────────────────────
-            _stt_t0 = time.monotonic()
-            logger.stt_start()
-            transcript = _transcribe_samples(samples)
-            if transcript:
-                logger.stt_result(transcript)
-            self._tracer.mark("stt_done")
-            _stt_ms = (time.monotonic() - _stt_t0) * 1000.0
+    # -- one turn --------------------------------------------------------
+    def _run_turn(self, utt: Utterance) -> None:
+        cfg = self.cfg
+        sp = self.speaker
+        epoch = sp.epoch
+        self._m_turns += 1
+        turn = self._m_turns
+        t_turn0 = time.monotonic()
+        trace.emit("turn_start", turn=turn, source=utt.source,
+                   queue_wait_ms=round((t_turn0 - utt.t_queued) * 1000),
+                   since_eos_ms=round((t_turn0 - utt.t_eos) * 1000))
+        self._llm_first_token_t = None
+        outcome, response, spoken_text = "completed", "", ""
+        stt_ms = llm_ms = 0.0
+        transcript = ""
+        narrator = ProgressNarrator(self, epoch, turn, utt.t_eos)
+        narrator.start()
+        speech: Optional[SpeechStreamer] = None
 
-            if transcript is None:
-                # Blank or failed STT — count it, speak specific fallback.
+        def cancelled() -> bool:
+            return sp.epoch != epoch or not self.running.is_set()
+
+        try:
+            # ── STT ──────────────────────────────────────────────────────
+            t0 = time.monotonic()
+            try:
+                stt_res = self._get_transcript(utt)
+                raw = stt_res.text
+            except Exception as e:
+                log.error("STT failed: %s", e)
+                trace.emit("error", where="stt", msg=str(e), turn=turn)
+                logger.error(f"stt: {e}")
+                narrator.stop()
+                outcome = "stt_error"
+                self._earcon("error", epoch)
+                self._say("fallback_stt", epoch)
+                self._recover_servers()
+                return
+            stt_ms = (time.monotonic() - t0) * 1000
+            transcript = tu.clean_transcript(raw or "")
+            trace.emit("stt_done", turn=turn, ms=round(stt_ms), raw=(raw or "")[:600], text=transcript[:600],
+                       logprob=None if stt_res.avg_logprob is None else round(stt_res.avg_logprob, 2),
+                       min_word=None if stt_res.min_word_prob is None else round(stt_res.min_word_prob, 2))
+            log.info("STT (%.0fms): %r", stt_ms, raw)
+
+            if cancelled():
+                outcome = "cancelled"
+                return
+
+            core = tu.strip_wake_phrase(transcript, cfg.wakeword)
+            if tu.is_hallucination(raw) or not transcript:
                 self._m_blank_stt += 1
-                self.processing_busy.clear()
-                try:
-                    self._play_earcon(self.error_earcon_pcm)
-                    self.phrases.play("fallback_stt")
-                    self._set_cooldown()
-                except Exception as e:
-                    print(f"[{stamp()}] STT fallback phrase failed: {e}")
-                continue
+                outcome = "blank"
+                narrator.stop()
+                if utt.source == "wake":
+                    self._say("yes", epoch)
+                elif utt.speech_ms >= 700:
+                    self._say("didnt_catch", epoch)
+                return
+            if not core:
+                # Only the wake phrase: invite the real request.
+                outcome = "wake_only"
+                narrator.stop()
+                self._say("yes", epoch)
+                return
 
-            fast_result = self._try_fast_path(transcript)
-            self._tracer.mark("response_ready")
-            _llm_ms = 0.0
-
-            if fast_result == "__STOP__":
-                self.conversation_mode.clear()
-                self._last_tts_end_time = None
-                self.processing_busy.clear()
-                self.phrases.play("goodbye")
-                self._set_cooldown()
-                continue
-
-            elif fast_result == "__REPEAT__":
-                response = self._last_response or "I don't have anything to repeat."
-                self.history.append({"role": "user", "content": transcript})
-
-            elif fast_result is not None:
-                response = fast_result
-                self._last_response = response
-                self.history.append({"role": "user", "content": transcript})
-                self.history.append({"role": "assistant", "content": response})
-
-            else:                                # Normal LLM path
-                self._maybe_summarize_oldest()
-                self.history.append({"role": "user", "content": transcript})
-                _llm_t0 = time.monotonic()
-                response = _run_llm(transcript)
-                self._tracer.mark("response_ready")
-                _llm_ms = (time.monotonic() - _llm_t0) * 1000.0
-                if response is None:
-                    self.processing_busy.clear()
-                    self._play_earcon(self.error_earcon_pcm)
-                    self._handle_server_error()
-                    continue
-                self.history.append({"role": "assistant", "content": self._trim_for_memory(response)})
-                self._last_response = response
-
-            self.cancel_event.clear()
-            self.processing_busy.clear()
-            self.is_speaking.set()
-
-            # ── TTS ───────────────────────────────────────────────────────────
-            _tts_t0 = time.monotonic()
-            logger.tts_start()
-            completed = _speak_with_cancel(response)
-            logger.tts_end()
-            self._tracer.mark("tts_done")
-            if self.cfg.metrics_enabled:
-                print(f"[LATENCY] {self._tracer.report()}")
-            _tts_ms = (time.monotonic() - _tts_t0) * 1000.0
-
-            self.is_speaking.clear()
-            self.cancel_event.clear()
-            # Apply full post-TTS cooldown so mic ignores speaker hardware drain.
-            self._set_cooldown(self.cfg.assistant_audio_cooldown_s)
-            self.last_tts_end_time = time.monotonic()
-
-            # ── Per-turn metrics log line ─────────────────────────────────────
-            # Printed after every turn so the terminal becomes the baseline log.
-            # Format matches docs/metrics.md so manual test recordings stay consistent.
-            _total_ms = (time.monotonic() - _turn_start) * 1000.0
-            if self.cfg.metrics_enabled:
-                print(
-                    f"[{stamp()}] METRICS "
-                    f"turn={self._m_turns} "
-                    f"stt={_stt_ms:.0f}ms "
-                    f"llm={_llm_ms:.0f}ms "
-                    f"tts={_tts_ms:.0f}ms "
-                    f"total={_total_ms:.0f}ms "
-                    f"dropped={self._m_dropped} "
-                    f"blank_stt={self._m_blank_stt} "
-                    f"false_wakes={self._m_false_wakes} "
-                    f"interrupts_ok={self._m_interrupt_success}"
-                )
-                # Collect all timing + outcome data for this turn into one record.
-                # debug_wav is the path saved by save_debug_wav (may be None if disabled).
-                self._log_turn({
-                    "ts":            time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "turn":          self._m_turns,
-                    "transcript":    transcript or "",
-                    "response_chars": len(response) if response else 0,
-                    "stt_ms":        round(_stt_ms, 1),
-                    "llm_ms":        round(_llm_ms, 1),
-                    "tts_ms":        round(_tts_ms, 1),
-                    "total_ms":      round(_total_ms, 1),
-                    "interrupted":   not completed,
-                    "failed":        response is None,
-                    "debug_wav":     str(self._last_debug_wav) if self._last_debug_wav else None,
-                })
-
-            if not completed:
-                # ── Interrupt path ────────────────────────────────────────────
-                self.cancel_event.clear()
-
-                # Drain any stale mic frames that built up during TTS.
-                # (Handled by T1 discarding frames while is_speaking was set —
-                # but clear interrupt_queue of any double-fire just in case.)
-                try:
-                    interrupt_samples = self.interrupt_queue.get_nowait()
-                    print(f"[{stamp()}] Interrupt audio dequeued ({len(interrupt_samples) / self.webrtc.sample_rate:.2f} seconds)")
-                except queue.Empty:
-                    # Interrupt signal arrived but no audio — treat as fresh
-                    # listen cycle.
-                    print(f"[{stamp()}] Interrupt with no audio — resuming listen")
-                    self._set_cooldown()
-                    self._last_tts_end_time = time.monotonic()
-                    continue
-
-                self.processing_busy.set()
-                interrupt_transcript = _transcribe_samples(interrupt_samples)
-                if interrupt_transcript is None:
-                    # Interrupt was noise — continue conversation normally.
-                    print(f"[{stamp()}] Interrupt transcribed as blank — continuing")
-                    self.processing_busy.clear()
-                    self._set_cooldown()
-                    self._last_tts_end_time = time.monotonic()
-                    continue
-
-                # Interrupt produced a usable transcript — count as success.
-                self._m_interrupt_success += 1
-
-                # Build combined transcript with context-aware joining.
-                _STOP_RE       = re.compile(
-                    r'^\s*(stop|cancel|nevermind|never mind|quit|shut up)\s*[.!?]?\s*$',
-                    re.I)
-                _CORRECTION_RE = re.compile(
-                    r'\b(actually|no\b|wait|that\'?s wrong|incorrect|never mind)\b',
-                    re.I)
-
-                if _STOP_RE.match(interrupt_transcript):
-                    # Pure stop: clear conversation, don't call LLM.
-                    print(f"[{stamp()}] Interrupt is STOP command — clearing conversation")
-                    self.conversation_mode.clear()
-                    self._last_tts_end_time = None
-                    self.processing_busy.clear()
-                    self._play_earcon(self.sleep_earcon_pcm)
-                    self.phrases.play("goodbye")
-                    self._set_cooldown()
-                    continue                        # ← back to top of while loop
-
-                elif _CORRECTION_RE.search(interrupt_transcript):
-                    # Correction: give LLM explicit signal, keep prior context.
-                    combined = (f"{transcript.rstrip('.')}. "
-                                f"[Correction] {interrupt_transcript}")
+            # ── Intents ──────────────────────────────────────────────────
+            cut_in = utt.source in ("barge", "interject")
+            intent = tu.classify_intent(core, barge=cut_in)
+            if intent is None and not stt_res.confident(cfg.stt_min_logprob):
+                # whisper itself does not believe this transcript ("Snobber."): don't feed garbage to the LLM.
+                narrator.stop()
+                trace.emit("stt_unclear", turn=turn, text=core[:80], logprob=stt_res.avg_logprob)
+                log.info("unclear transcript %r (logprob=%.2f) → not answering it", core, stt_res.avg_logprob or 0.0)
+                if cut_in and utt.speech_ms < 1400:
+                    outcome = "stop"             # a muffled word over the assistant almost always means "stop"
+                elif utt.source == "wake" and utt.speech_ms < 1300:
+                    outcome = "wake_only"        # a mangled "Hey Jarvis": invite the real request
+                    self._say("yes", epoch)
                 else:
-                    # New topic mid-answer: just use interrupt as the new query.
-                    combined = interrupt_transcript
+                    outcome = "unclear"
+                    self._say("didnt_catch", epoch)
+                return
+            if (intent is None and cut_in and utt.speech_ms < 700 and len(core.split()) <= 2
+                    and core.lower().strip(" .?!,") not in self._SHORT_QUESTIONS):
+                # A brief unrecognised word over the assistant ("Snava." for "stop") is a stop, not a request.
+                intent = "stop"
+                trace.emit("stt_short_cut_in", turn=turn, text=core[:40], logprob=stt_res.avg_logprob)
+            if intent:
+                trace.emit("intent", turn=turn, name=intent)
+                log.info("intent: %s", intent)
+            if intent == "stop":
+                narrator.stop()
+                was_busy = utt.source in ("barge", "interject")
+                sp.stop("voice_stop")
+                outcome = "stop"
+                if not was_busy:
+                    self._say("okay", sp.epoch)
+                return
+            if intent == "sleep":
+                narrator.stop()
+                outcome = "sleep"
+                self.conversation_mode.clear()
+                trace.emit("sleep", why="voice")
+                self._earcon("sleep", epoch)
+                self._say("goodbye", epoch)
+                return
+            if intent == "repeat":
+                response = self._last_response
+                if not response:
+                    narrator.stop()
+                    self._say("nothing_to_repeat", epoch)
+                    outcome = "repeat_empty"
+                    return
+                outcome = "repeat"
+                self.history.append({"role": "user", "content": core})
+                speech = SpeechStreamer(self.tts, sp, epoch, turn)
+                narrator.stop()
+                chunker = tu.SentenceChunker()
+                for ch in chunker.feed(response + " ") + chunker.flush():
+                    speech.submit(ch)
+                speech.finish()
+                ok = speech.wait()
+                spoken_text = " ".join(speech.spoken)
+                self.history.append({"role": "assistant", "content": tu.trim_for_memory(response, cfg.memory_assistant_max_chars)})
+                if not ok:
+                    outcome = "interrupted" if cancelled() else "tts_error"
+                return
+            fast = tu.answer_intent(intent, None) if intent else None
 
-                print(f"""[{stamp()}] Combined transcript ({
-                      'correction' if _CORRECTION_RE.search(interrupt_transcript) else 'new'
-                      }): {combined!r}""")
+            # ── Answer: instant or LLM-streamed ─────────────────────────
+            speech = SpeechStreamer(self.tts, sp, epoch, turn)
+            chunker = tu.SentenceChunker()
+            history = list(self.history)
+            parts: List[str] = []
+            llm_error: Optional[Exception] = None
+            first_chunk_seen = False
 
-                # Update history: replace the last user entry with combined.
-                # Pop assistant turn (last) and user turn (second to last),
-                # then re-add combined user turn. LLM gets the full context.
-                if len(self.history) >= 2:
-                    self.history.pop()  # remove assistant response
-                    self.history.pop()  # remove original user message
-                    self.history.append({"role": "user", "content": combined})
+            def emit_chunks(chunks):
+                nonlocal first_chunk_seen
+                for ch in chunks:
+                    if not first_chunk_seen:
+                        first_chunk_seen = True
+                        narrator.stop()
+                        trace.emit("first_chunk", turn=turn, since_eos_ms=round((time.monotonic() - utt.t_eos) * 1000),
+                                   text=ch[:80])
+                    speech.submit(ch)
 
-                response = _run_llm(combined)
-                self._tracer.mark("response_ready")
-                if response is None:
-                    self.processing_busy.clear()
-                    # _handle_server_error will now try restarts and play a
-                    # specific LLM / generic fallback phrase.
-                    self._handle_server_error()
-                    continue
+            if fast:
+                outcome = "fast_" + intent
+                response = fast
+                emit_chunks([fast])
+            else:
+                logger.llm_start()
+                t_llm = time.monotonic()
+                trace.emit("llm_start", turn=turn, history=len(history))
+                try:
+                    for delta in self.llm.stream(core, history, cancel=cancelled):
+                        if not parts:
+                            self._llm_first_token_t = time.monotonic()
+                            trace.emit("llm_first_token", turn=turn, ms=round((time.monotonic() - t_llm) * 1000))
+                        parts.append(delta)
+                        emit_chunks(chunker.feed(delta))
+                    llm_ms = (time.monotonic() - t_llm) * 1000
+                    if not cancelled():
+                        rest = chunker.flush()
+                        if self.llm.last_finish_reason == "length" and rest:
+                            rest = [tu.trim_to_sentence(r) for r in rest]
+                        emit_chunks(rest)
+                except LLMError as e:
+                    llm_error = e
+                    llm_ms = (time.monotonic() - t_llm) * 1000
+                logger.llm_result()
+                response = "".join(parts).strip()
+                trace.emit("llm_done", turn=turn, ms=round(llm_ms), tokens=self.llm.last_tokens,
+                           finish=self.llm.last_finish_reason, chars=len(response),
+                           error=str(llm_error) if llm_error else None)
+                log.info("LLM (%.0fms, %d tok, %s): %r", llm_ms, self.llm.last_tokens,
+                         self.llm.last_finish_reason, response[:120])
 
-                self.history.append(
-                    {
-                        "role": "assistant",
-                        "content": self._trim_for_memory(response),
-                    }
-                )
+            narrator.stop() if (first_chunk_seen or llm_error) else None
+            speech.finish()
+            ok = speech.wait()
+            spoken_text = " ".join(speech.spoken)
 
-                self.cancel_event.clear()
-                self.processing_busy.clear()
-                self.is_speaking.set()
-                # Guard window at the START of TTS playback so the opening phrase
-                # doesn't self-trigger the wake word listener.
-                self._set_cooldown(self.cfg.tts_playback_guard_s)
-                logger.tts_start()
-                _speak_with_cancel(response)
-                logger.tts_end()
-                self.is_speaking.clear()
-                self.cancel_event.clear()
+            if llm_error is not None:
+                outcome = "llm_timeout" if isinstance(llm_error, LLMTimeout) else "llm_error"
+                log.error("LLM failed: %s", llm_error)
+                trace.emit("error", where="llm", msg=str(llm_error), turn=turn)
+                logger.error(f"llm: {llm_error}")
+                if not cancelled():
+                    self._earcon("error", epoch)
+                    self._say("llm_timeout" if isinstance(llm_error, LLMTimeout) else "fallback_llm", epoch)
+                    self._recover_servers()
+            elif speech.failed and not cancelled():
+                outcome = "tts_error"
+                self._earcon("error", epoch)
+                self._say("fallback_tts", epoch)
+                self._recover_servers()
+            elif cancelled():
+                outcome = "interrupted"
+            elif not response:
+                outcome = "empty_response"
+                self._say("fallback_generic", epoch)
+            elif not ok:
+                outcome = "interrupted"
 
-            # Record when TTS last finished — drives conversation timeout.
-            self._last_tts_end_time = time.monotonic()
-            self._set_cooldown()
+            # Memory: only remember what the user actually heard.
+            remembered = response if outcome in ("completed",) or outcome.startswith("fast_") else spoken_text
+            if outcome == "interrupted":
+                remembered = (tu.trim_for_memory(spoken_text, cfg.memory_assistant_max_chars) + " [interrupted]").strip()
+            if outcome in ("completed", "interrupted") or outcome.startswith("fast_"):
+                self.history.append({"role": "user", "content": core})
+                self.history.append({"role": "assistant",
+                                     "content": tu.trim_for_memory(remembered, cfg.memory_assistant_max_chars) or "(no answer)"})
+                self._last_response = response or self._last_response
+            if outcome == "interrupted":
+                self._m_interrupt_success += 1
+        finally:
+            narrator.stop()
+            if speech is not None:
+                speech.finish()
+            total_ms = (time.monotonic() - t_turn0) * 1000
+            since_eos = (time.monotonic() - utt.t_eos) * 1000
+            first_audio_ms = None
+            if speech is not None and speech.first_audio_t is not None:
+                first_audio_ms = round((speech.first_audio_t - utt.t_eos) * 1000)
+            trace.emit("turn_end", turn=turn, outcome=outcome, total_ms=round(total_ms),
+                       since_eos_ms=round(since_eos), first_audio_ms=first_audio_ms,
+                       stt_ms=round(stt_ms), llm_ms=round(llm_ms), transcript=transcript[:600],
+                       response=response[:600], spoken=spoken_text[:600], narration=narrator.events)
+            if cfg.metrics_enabled:
+                log.info("METRICS turn=%d outcome=%s stt=%.0fms llm=%.0fms first_audio=%sms total=%.0fms narration=%d",
+                         turn, outcome, stt_ms, llm_ms, first_audio_ms, total_ms, narrator.events)
+                self._log_turn({
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "turn": turn,
+                    "transcript": transcript, "response_chars": len(response),
+                    "stt_ms": round(stt_ms, 1), "llm_ms": round(llm_ms, 1),
+                    "total_ms": round(total_ms, 1), "first_audio_ms": first_audio_ms,
+                    "interrupted": outcome == "interrupted", "failed": outcome.endswith("_error") or outcome == "llm_timeout",
+                    "outcome": outcome, "debug_wav": str(self._last_debug_wav) if self._last_debug_wav else None,
+                })
+            self.last_activity = time.monotonic()
 
     # ------------------------------------------------------------------
     # Server error recovery
     # ------------------------------------------------------------------
-    def _handle_server_error(self) -> None:
+    def _recover_servers(self) -> None:
         """
-        Check all servers, restart any that are down, with simple
-        retry + backoff. Then play a specific spoken fallback so the
-        user hears what went wrong.
+        Restart any server that stopped answering its health check. A server that was just
+        (re)started and is still loading its model is waited for, never started twice
+        (the LLM can take a minute to load).
         """
-        failed_services = []
-
         for srv in SERVERS:
-            name = srv.get("name", "unknown")
-            url = srv.get("url", "")
-            if _ping(url):
+            if _ping(srv["url"], timeout=3):
                 continue
-
-            print(f"[{stamp()}] {name} appears down at {url} — attempting restart...")
-            failed_services.append(name)
-
-            # Simple retry with exponential backoff.
-            max_attempts = 3
-            base_delay_s = 1.0
-            for attempt in range(1, max_attempts + 1):
-                self._m_server_restarts += 1
-                print(
-                    f"[{stamp()}] Restart attempt {attempt}/{max_attempts} for {name}"
-                )
-                _start(srv)
-
-                # Backoff: 1s, 2s, 4s.
-                delay = base_delay_s * (2 ** (attempt - 1))
-                time.sleep(delay)
-
-                if _ping(url):
-                    print(f"[{stamp()}] {name} is healthy again after restart")
+            name = srv["name"]
+            log.error("%s server down at %s → restarting", name, srv["url"])
+            trace.emit("server_down", name=name)
+            spawns, deadline = 0, time.monotonic() + (120 if name == "LLM" else 60)
+            proc = self._server_procs.get(name)
+            while time.monotonic() < deadline and self.running.is_set():
+                if proc is None or proc.poll() is not None:
+                    if spawns >= 3:
+                        break
+                    proc = self._server_procs[name] = _start(srv)
+                    spawns += 1
+                    self._m_server_restarts += 1
+                if _ping(srv["url"], timeout=3):
+                    log.info("%s healthy again (after %d spawn(s))", name, spawns)
+                    trace.emit("server_restarted", name=name, spawns=spawns)
                     break
+                time.sleep(1.5)
             else:
-                print(f"[{stamp()}] {name} still unhealthy after {max_attempts} attempts")
-
-        # Choose a spoken fallback phrase based on what failed.
-        try:
-            if not failed_services:
-                # Generic failure – e.g., STT returned None but all services pinged OK.
-                self.phrases.play("fallback_generic")
-            else:
-                # Map service names to more specific fallbacks.
-                down = set(s.lower() for s in failed_services)
-                if any("whisper" in s or "stt" in s for s in down):
-                    self.phrases.play("fallback_stt")
-                elif any("gemma" in s or "llm" in s for s in down):
-                    self.phrases.play("fallback_llm")
-                elif any("kokoro" in s or "tts" in s for s in down):
-                    self.phrases.play("fallback_tts")
-                else:
-                    self.phrases.play("fallback_generic")
-
-            self._set_cooldown()
-        except Exception as e:
-            print(f"[{stamp()}] Fallback phrase playback failed: {e}")
+                log.error("%s still down after waiting", name)
 
     # ------------------------------------------------------------------
-    # Memory management
+    # Lifecycle
     # ------------------------------------------------------------------
-    def _maybe_summarize_oldest(self) -> None:
-        """If history is at capacity, shorten the oldest user message to a short
-        keyword stub so it still gives topic context without wasting token budget.
-        Only acts when the deque is full (all turns occupied)."""
-        max_msgs = self.cfg.memory_turns * 2
-        if len(self.history) < max_msgs:
-            return  # Still have room, nothing to compress
-        # The oldest entry is a user message (index 0 in the deque)
-        oldest = self.history[0]
-        if oldest["role"] == "user" and len(oldest["content"]) > 60:
-            # Compress to first 60 chars, trim to last word boundary
-            stub = oldest["content"][:60]
-            last_space = stub.rfind(' ')
-            if last_space > 20:
-                stub = stub[:last_space]
-            self.history[0] = {"role": "user", "content": f"[earlier: {stub}…]"}
-    
-    def _trim_for_memory(self, text: str) -> str:
-        """Keep only the first N chars of a reply, but end on a sentence boundary.
-        This avoids storing half-sentences that confuse the LLM on next turn."""
-        limit = self.cfg.memory_assistant_max_chars
-        if len(text) <= limit:
-            return text
-        # Find the last sentence-ending punctuation before the limit
-        cut = text.rfind('.', 0, limit)
-        if cut == -1:
-            cut = text.rfind('?', 0, limit)
-        if cut == -1:
-            cut = text.rfind('!', 0, limit)
-        # Fall back to hard cut if no punctuation found
-        return text[:cut + 1] if cut > 0 else text[:limit]
+    def _validate_config(self) -> None:
+        seen = set()
+        for srv in SERVERS:
+            url, name = srv.get("url", ""), srv.get("name", "?")
+            try:
+                port = int(url.split("://", 1)[1].split("/", 1)[0].rsplit(":", 1)[1])
+            except Exception:
+                print(f"[{stamp()}] Config error: cannot parse port from {name} URL: {url}")
+                sys.exit(1)
+            if port in seen:
+                print(f"[{stamp()}] Config error: duplicate port {port} in SERVERS")
+                sys.exit(1)
+            seen.add(port)
 
-    
-
-    def _try_fast_path(self, transcript: str) -> str | None:
-        if not getattr(self.cfg, 'fast_path_enabled', True):
-            return None
-        for pattern, handler in self._FP:
-            if pattern.search(transcript):
-                result = handler()
-                print(f"[FastPath] {result[:60]}")
-                return result
-        return None
-
-    # ------------------------------------------------------------------
-    # Entry point
-    # ------------------------------------------------------------------
-    def run(self) -> None:
-        print(
-            "Pipeline: WebRTC -> openWakeWord -> Silero -> "
-            "Whisper[8081] -> Gemma[8080] -> Kokoro[8082]"
-        )
-        print(f"wakeword={self.cfg.wakeword} sample_rate={self.cfg.sample_rate}")
-        print(
-            f"memory_turns={self.cfg.memory_turns} "
-            f"utterance_floor_ms={self.cfg.utterance_floor_ms}"
-        )
-        print(
-            f"conversation_timeout={self.cfg.conversation_timeout_s}s "
-            f"interrupt_min_speech={self.cfg.interrupt_min_speech_ms}ms"
-        )
-
-        # Validate configuration and audio hardware before touching servers.
+    def start(self, wait_servers: bool = True) -> None:
+        """Open devices, warm everything up and start the worker threads (non-blocking)."""
+        trace.open() if trace.path is None else None
+        log.info("Pipeline: WebRTC → openWakeWord(%s) → Silero → Whisper → Gemma(stream) → Kokoro(stream)",
+                 self.cfg.wakeword_framework)
+        log.info("wakeword=%s sr=%d memory_turns=%d silence_hold=%dms barge_in=%dms timeout=%ds",
+                 self.cfg.wakeword, self.cfg.sample_rate, self.cfg.memory_turns,
+                 self.cfg.utterance_silence_hold_ms, self.cfg.interrupt_min_speech_ms,
+                 self.cfg.conversation_timeout_s)
         self._validate_config()
-        self._validate_microphone()
-
-        wait_for_servers()
+        if wait_servers:
+            wait_for_servers()
         self.phrases.warm_up()
+        threading.Thread(target=self.llm.warm_up, name="LLMWarmup", daemon=True).start()
 
-        print("Press Ctrl+C to stop.")
+        self._backend = self._backend or PyAudioBackend()
+        self.speaker = Speaker(self._backend, drain_extra_s=self.cfg.tts_drain_extra_s)
+        if self.aec is not None:
+            self.speaker.taps.append(
+                lambda t_item, off, seg, sr, item, gains: self.aec.ref.push_queued(item, off, len(seg), sr, gains))
+        self._mic = self._injected_mic or PyAudioMic(self.cfg, self.webrtc.frame_samples)
+        self._mic.open()
 
-        audio, stream = self.webrtc.open()
+        self._stt_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="SpecSTT")
+        self.running.set()
+        self.last_activity = time.monotonic()
+        for target, name in ((self._audio_thread, "AudioThread"), (self._processing_thread, "ProcessingThread")):
+            th = threading.Thread(target=target, name=name, daemon=True)
+            th.start()
+            self._threads.append(th)
+        if self.aec is not None and self.cfg.aec_calibrate_on_start:
+            self.speaker.enqueue(AudioItem("calib", make_calibration(self.cfg.sample_rate), self.cfg.sample_rate,
+                                           label="aec_calibration"))
+            self.speaker.wait_idle(5.0)
+            time.sleep(0.3)
+        self._earcon("wake")
+        trace.emit("ready")
+        log.info("ready — say '%s'", self.cfg.wakeword.replace("_", " "))
 
-        t1 = threading.Thread(
-            target=self._audio_thread,
-            args=(stream,),
-            name="AudioThread",
-            daemon=True,
-        )
-        t2 = threading.Thread(
-            target=self._processing_thread,
-            name="ProcessingThread",
-            daemon=True,
-        )
+    def stop(self) -> None:
+        self.running.clear()
+        if self.speaker:
+            self.speaker.shutdown()
+        for th in self._threads:
+            th.join(timeout=3.0)
+        if self._mic:
+            self._mic.close()
+        if self._stt_pool:
+            self._stt_pool.shutdown(wait=False, cancel_futures=True)
+        trace.emit("stopped")
 
-        t1.start()
-        t2.start()
+    def print_summary(self) -> None:
+        print("\n── Metrics Summary ──────────────────────────────────────")
+        print(f"  Turns completed        : {self._m_turns}")
+        print(f"  Replaced utterances    : {self._m_dropped}")
+        print(f"  Blank STT results      : {self._m_blank_stt}")
+        print(f"  Rejected captures      : {self._m_false_wakes}")
+        print(f"  Interrupts detected    : {self._m_interrupt_detected}")
+        print(f"  Interrupted turns      : {self._m_interrupt_success}")
+        print(f"  Server restart attempts: {self._m_server_restarts}")
+        print("─────────────────────────────────────────────────────────\n")
 
+    def run(self) -> None:
+        self._validate_microphone_early()
+        self.start()
+        signal.signal(signal.SIGTERM, lambda *_: self.running.clear())
         try:
-            # Main thread just keeps the process alive and handles Ctrl+C.
-            while t1.is_alive():
-                t1.join(timeout=1.0)
+            while self.running.is_set() and self._threads[0].is_alive():
+                time.sleep(0.5)
         except KeyboardInterrupt:
             print("\nStopping pipeline...")
-            self.running.clear()
         finally:
-            self.running.clear()
-            t1.join(timeout=3.0)
-            t2.join(timeout=3.0)
-            stream.stop_stream()
-            stream.close()
-            audio.terminate()
-
-            # ── Exit summary ──────────────────────────────────────────────────
-            # Printed once on graceful shutdown (Ctrl+C or clean exit).
-            # Record these numbers as your Week 1 baseline in docs/metrics.md.
+            self.stop()
             if self.cfg.metrics_exit_summary:
-                print("\n── Metrics Summary ──────────────────────────────────────")
-                print(f"  Turns completed        : {self._m_turns}")
-                print(f"  Dropped utterances     : {self._m_dropped}")
-                print(f"  Blank STT results      : {self._m_blank_stt}")
-                print(f"  False wakes            : {self._m_false_wakes}")
-                print(f"  Interrupts detected    : {self._m_interrupt_detected}")
-                print(f"  Interrupts succeeded   : {self._m_interrupt_success}")
-                print(f"  Server restart attempts: {self._m_server_restarts}")
-                print("─────────────────────────────────────────────────────────\n")
-
+                self.print_summary()
             print("Stopped.")
+
+    def _validate_microphone_early(self) -> None:
+        if self._injected_mic is not None:
+            return
+        import pyaudio
+        from audio.devices import MicError, resolve_from_cfg
+        pa = pyaudio.PyAudio()
+        try:
+            try:
+                dev = resolve_from_cfg(pa, self.cfg)
+                s = pa.open(format=pyaudio.paInt16, channels=1, rate=self.cfg.sample_rate, input=True,
+                            input_device_index=dev.index, frames_per_buffer=256)
+                s.close()
+            except (MicError, OSError) as e:
+                print(f"[{stamp()}] Audio error: {e}\n  List devices: python -m audio.devices   "
+                      f"Select: MIC_NAME=<substring> or MIC_INDEX=<n>")
+                sys.exit(1)
+        finally:
+            pa.terminate()
 
 
 if __name__ == "__main__":

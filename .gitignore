@@ -221,3 +221,7 @@ debug_audio/**/*
 debug_logs/**/*
 test_clips/**/*
 .vscode/mcp.json
+
+# E2E evaluation artifacts and cached synthetic user speech
+reports/
+tests/e2e/.cache/

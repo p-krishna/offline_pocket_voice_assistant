@@ -1,11 +1,15 @@
 # Wake-word stack for Ubuntu 22.04 desktop prototype
 # Known-good direction from current testing:
 # - Python 3.11
-# - numpy < 2
+# - numpy >= 2 (kokoro-onnx >= 0.5); the wake word runs on ONNX (WAKEWORD_FRAMEWORK=onnx), so the old
+#   tflite-runtime / numpy<2 pin is no longer needed
 # - openwakeword 0.6.x
 # - speexdsp-ns from PyPI
 
-numpy<2
+numpy>=2.0.2
+setuptools<81
+scipy
+pytest
 openwakeword>=0.6,<0.7
 speexdsp-ns>=0.1.2
 pyaudio
