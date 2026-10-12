@@ -68,7 +68,7 @@ def last_turn_end(w: World, since: int = 0) -> Optional[dict]:
 
 
 # ── invariants every scenario must satisfy ───────────────────────────────────
-def generic_checks(w: World, allow_errors: bool = False) -> List[Check]:
+def generic_checks(w: World, allow_errors: bool = False, allow_unsettled: bool = False) -> List[Check]:
     ev = w.events
     items = audio_items(ev)
     checks: List[Check] = []
@@ -90,10 +90,12 @@ def generic_checks(w: World, allow_errors: bool = False) -> List[Check]:
 
     # 3. Every turn that started ended (no stuck turns).
     starts, ends = len(w.find("turn_start")), len(w.find("turn_end"))
-    checks.append(Check("every turn ended", starts == ends, f"{starts} started / {ends} ended"))
+    checks.append(Check("every turn ended", starts == ends, f"{starts} started / {ends} ended",
+                        severity="warn" if allow_unsettled else "fail"))
 
     # 4. Pipeline returned to a listening state (T1 alive, no stuck turn flag).
     alive = all(t.is_alive() for t in w.pipe._threads)
     checks.append(Check("threads alive", alive))
-    checks.append(Check("returned to idle (no stuck turn)", w.wait_quiet(15), ""))
+    checks.append(Check("returned to idle (no stuck turn)", w.wait_quiet(15), "",
+                        severity="warn" if allow_unsettled else "fail"))
     return checks

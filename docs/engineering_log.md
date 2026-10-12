@@ -13,7 +13,8 @@ mistake was found. Add new entries with today's date; do not rewrite old ones, a
 | 8 | "before you change X, re-run Y" |
 | 9 | microphone input selection (formerly `microphone.md`) |
 | 10 | open work for robustness (audit of the former `roadmap.md`) |
-| 11 | critical review of 2026-10-13: every fault found, the fix required, and its status |
+| 11 | critical review of 2026-10-13: every fault found and the fix required |
+| 12 | fixes applied for that review: what changed, why, how it was verified, what did *not* work |
 
 Dating note: everything in the uncommitted `repurpose_as_german_tutor` working tree was written on 2026-10-08 (hardening
 and test harness 00:11–02:42, microphone work 08:15–08:19, by file timestamps). Documentation was consolidated on
@@ -107,26 +108,34 @@ Measured from the end of the user's audio clip (clips carry ≈ 150 ms of TTS tr
 | 2026-10-08 | **Dead code that looked alive.** | Interrupt queue never filled; `last_tts_end_time` vs `_last_tts_end_time`; `datetime.now()` on the module. | Typos in attribute names fail silently in Python. The trace + E2E scenarios exist to catch "this branch never runs"; prefer asserting behaviour a person would notice. |
 | 2026-10-08 | **Substring intent matching.** | "I want to stop at the store" → goodbye. | Intents match near-whole utterances only; cut-in acknowledgements are valid only *while the assistant is talking/thinking*. |
 | 2026-10-08 | **Process hygiene.** | `pkill -f <pattern>` killed the shell whose command line contained the pattern; first E2E run after a cold cache perturbed timings because user-speech synthesis shared the TTS server. | Kill by PID or a pattern that does not appear in your own command line. Pre-synthesize user audio before the scenario starts and re-run for clean numbers. |
+| 2026-10-13 | **Carried a pass/fail claim forward without opening the reports.** "37 scenarios, 0 failed checks" was copied from a summary written earlier; the report folder showed a failing `barge_in_stop`. | The docs asserted a result no run supported. | A number in the docs must name the run directory it came from (§12.3 does). |
+| 2026-10-13 | **Tuned and judged on the same synthetic data.** Thresholds (`STT_MIN_LOGPROB`, 190 ms, …) were set on the scenarios that then "validated" them. | Real-room behaviour is unknown. | Keep a held-out set of real recordings; until then say "synthetic only". |
+| 2026-10-13 | **Wrote reconstructed rationale as history.** §7's "rejected alternatives" were inferred from the code. | Plausible but unrecorded reasons look like decisions. | Label inferred rationale as inferred; record the decision when it is made. |
+| 2026-10-13 | **Mis-diagnosed the echo canceller from a metric.** "ERLE ≈ 9 dB ⇒ weak filter" and raising the trust threshold to 12 dB broke barge-in through echo. | ERLE is measured against everything in the mic, including the room's noise floor. | Do not tune a safety margin from a metric before checking what bounds it; A/B it with the scenario that exercises it. |
+| 2026-10-13 | **A derived flag that follows a noisy signal.** `trusted` was recomputed from the smoothed ERLE, which dips in quiet spells, so barge-in caution flipped on and off (`barge_in_through_echo` failed 2 of 7 runs vs 0 of 6 before). | Latched `converged` had hidden that. | Latch state flags; check flakiness with ≥ 5 repeats against the previous commit before accepting a change. |
+| 2026-10-13 | **Changing a behaviour and leaving its measurement unchanged.** After barge-in became pause-then-confirm, `barge_in_stop` still timed the end of the audio item. | A correct change failed the test. | When behaviour changes on purpose, update and *document* the check in the same change (§12.2). |
 | 2026-10-08 | **Env pin whack-a-mole.** | `numpy<2` vs kokoro-onnx, `setuptools>=81` vs webrtcvad. | Remove the conflict rather than pinning around it (wake word on ONNX; `setuptools<81`). Both are recorded in `configs/`. |
 
 ## 7. Design decisions and their justification
 
-Format: **decision** — why — what we rejected. Config names are in `src/common/config.py`.
+Format: **decision** — why — what we rejected. The *why* and *rejected* parts of the 2026-10-08 entries were
+reconstructed from the code and the defect log on 2026-10-13 (review D1); only the defect log (§1–§3) is
+contemporaneous. Config names are in `src/common/config.py`.
 
 ### Audio I/O
 * **2026-10-08** · **One serialised speaker (`audio/speaker.py`) for earcons, cached phrases and TTS.** Independent threads/devices
   overlapped and raced; one queue means sounds cannot overlap and a single `stop()` silences everything.
-  Rejected: per-component playback with locks (every new sound source re-opens the race).
+  Rejected (inferred on 2026-10-13, not recorded when the decision was made): per-component playback with locks (every new sound source re-opens the race).
 * **2026-10-08** · **Epoch-based cancellation.** `stop()` bumps an epoch; every queued item and every stage of a turn carries the
   epoch it began in and is dropped when it no longer matches. A TTS sentence that finishes synthesising *after* a
-  barge-in therefore cannot play. Rejected: cancelling threads individually (late arrivals slip through).
+  barge-in therefore cannot play. Rejected (inferred on 2026-10-13, not recorded when the decision was made): cancelling threads individually (late arrivals slip through).
 * **2026-10-08** · **20 ms write chunks (`CHUNK_S`).** Bounds stop latency to about one chunk plus the device buffer.
 * **2026-10-08** · **Software AEC (PBFDAF, 30 ms blocks, 14 partitions ≈ 420 ms span).** On loudspeakers the assistant's voice is
   indistinguishable from speech to the VAD and it interrupted itself. We know exactly what we play, so we predict
   and subtract it. Partitioned frequency-domain filtering gives a long filter cheaply on CPU; block size equals the
   mic frame so no extra buffering/latency; span must cover device latency + room path (`AEC_PARTITIONS`).
   Freezing adaptation during double-talk stops it learning the user's voice; a divergence guard resets it; the
-  freeze is lifted after ~3 s so a changed echo path is still tracked. Rejected: "mute the mic while speaking" (kills
+  freeze is lifted after ~3 s so a changed echo path is still tracked. Rejected (inferred on 2026-10-13, not recorded when the decision was made): "mute the mic while speaking" (kills
   barge-in, which is the point), and a fixed post-TTS cooldown only (still hears the tail, blocks the user).
 * **2026-10-08** · **GCC-PHAT delay lock + ~2 s soft-noise calibration at startup (`AEC_CALIBRATE_ON_START`).** The delay is
   unknown (device buffers differ); noise is broadband so it trains every bin before the first reply, rather than
@@ -143,7 +152,7 @@ Format: **decision** — why — what we rejected. Config names are in `src/comm
   sentences, too short for hesitation. Speculative STT starts after 420 ms of silence (`SPECULATIVE_STT_MS`) and the
   transcript decides the hold: finished sentence 0.56 s, trailing "and…" 1.5 s, bare wake word 2.2 s, default 0.8 s.
   The speculative transcript is of *exactly* the audio that is finally sent, so there is no second STT pass.
-  Rejected: bigger fixed hold (sluggish), end-of-turn ML model (extra dependency, offline footprint).
+  Rejected (inferred on 2026-10-13, not recorded when the decision was made): bigger fixed hold (sluggish), end-of-turn ML model (extra dependency, offline footprint).
 * **2026-10-08** · **1.3 s wake lead-in (`UTTERANCE_WAKE_PRE_ROLL_MS`) + fuzzy wake-phrase stripping.** openWakeWord fires late in
   "Hey Jarvis"; a short pre-roll left fragments ("Darvis", "Harvest") that went to the LLM. Capturing the whole
   phrase and stripping it is more reliable than trying to cut precisely.
@@ -159,11 +168,18 @@ Format: **decision** — why — what we rejected. Config names are in `src/comm
   delayed it past usefulness. Measured: 0.40 s median stop latency.
 * **2026-10-08** · **Duck our voice to 25 % after 60 ms of speech (`BARGE_IN_DUCK_*`).** Instant feedback before confirmation and it
   reduces the echo fed back into the mic; restored on a false alarm so a cough does not destroy an answer.
-* **2026-10-08** · **Cutting in over answer audio stops it immediately; over silence/filler it only records until STT confirms.**
-  Rationale: stopping an answer is cheap to undo; cancelling a pending LLM answer because of a cough is not.
+* **2026-10-13** · **Cutting in over answer audio *pauses* it (fade-out, hold position); STT decides.** Replaces the
+  2026-10-08 behaviour (stop immediately, no way back), whose "cheap to undo" rationale was wrong: nothing could undo
+  it, so a cough that passed Silero destroyed the answer (F11). Now: noise ⇒ the answer resumes where it stopped;
+  "stop" / a muffled short word ⇒ stop and stay silent; real speech ⇒ stop and answer it. The user hears silence
+  as fast as before; only the *decision* waits for STT. An unresolved pause continues after 40 s
+  (`BARGE_IN_PAUSE_TIMEOUT_S`) so a crashed confirmation can never leave the assistant mute. Over silence/filler
+  (thinking phase) nothing is paused; the pending answer is cancelled only after STT confirms speech.
+* **2026-10-13** · **Acknowledgements are answers when we just asked a question.** "yes/okay/no/sure" over a reply
+  that ended in "?" go to the LLM instead of stopping it (F8); essential for a tutor that asks questions.
 * **2026-10-08** · **Whisper confidence gate (`STT_MIN_LOGPROB=-0.7`).** tiny.en turns short words into confident-looking garbage.
   Unclear *cut-in* ⇒ treat as stop; unclear *request* ⇒ "Sorry, I didn't catch that"; never feed it to the LLM.
-  Rejected: always sending transcripts to the LLM (it answers "Snobber.").
+  Rejected (inferred on 2026-10-13, not recorded when the decision was made): always sending transcripts to the LLM (it answers "Snobber.").
 
 ### Latency and feedback
 * **2026-10-08** · **Stream tokens → sentence chunker → TTS prefetch → gapless playback; first clause released early (12 words).**
@@ -208,6 +224,8 @@ Format: **decision** — why — what we rejected. Config names are in `src/comm
 | LLM client / timeouts | `slow_llm_narration`, `very_slow_llm`, `llm_*` | slow vs dead distinction |
 | system prompt, language | the tests override the prompt (`tests/e2e/harness.py`); STT is `*.en`, TTS voice is English | see below |
 | STT model | `make test-e2e` + compare latency: base.en ≈ 2× tiny.en | accuracy vs responsiveness |
+| `Speaker.pause/resume`, `_confirm_interject`, intents / wake stripping | `make test-unit`, then `barge_in_stop`, `barge_in_new_question`, `barge_in_with_wake_phrase`, `non_word_over_answer_resolves`, `cough_*` | the decision after speech over an answer has five outcomes; unit tests pin them, E2E proves the audio side |
+| any flag derived from `erle_db` or other smoothed signals | `barge_in_through_echo` ×5 against the previous commit | a flag that follows a noisy signal made barge-in flaky (§6, 2026-10-13) |
 
 **Language mismatch to resolve:** the working-tree system prompt is the German tutor (`config.py`), but Whisper
 `tiny.en`, `WHISPER_LANGUAGE=en`, the English Kokoro voice and the English filler phrases are unchanged, so German
@@ -232,9 +250,9 @@ nothing instead of falling back to default).
 env's alsa-lib has no PulseAudio plugin (`libasound_module_pcm_pulse.so` missing), so `default` fell through to
 **card 0, the onboard Intel PCH analog input** (`/proc/asound/card0/pcm0c` was RUNNING) — a line/mic jack with
 nothing plugged in, i.e. near-silence (rms≈20). PulseAudio's default source *was* the Jabra, but PortAudio never went
-through Pulse. The Jabra is PortAudio index 0 (`hw:1,0`, mono, opens fine at 16 kHz). For a day this was
-misdiagnosed as "the machine's mic is digital silence" and the E2E suite was built on a room simulator because of it
-(the simulator is still the right tool for repeatable timing tests, but the premise was wrong).
+through Pulse. The Jabra is PortAudio index 0 (`hw:1,0`, mono, opens fine at 16 kHz). It was first
+misdiagnosed as "the machine's mic is digital silence" and the original findings text justified the room
+simulator with it (the simulator is still the right tool for repeatable timing tests, but that premise was wrong).
 
 **What changed (2026-10-08)**
 - `src/audio/devices.py` (new): lists inputs, resolves index → name → default (warns loudly).
@@ -264,13 +282,13 @@ instrumentation / reliability / turn-taking goals are met by the work above). St
 |---|---|---|
 | per-turn timing, counters, metrics summary | done | trace JSONL, `turns_<date>.jsonl`, `print_summary`, `make analyze-trace` |
 | startup validation: ports, mic | done | `_validate_config`, `_validate_microphone_early` |
-| startup validation: **model files exist** | **open** | servers simply fail to start; no clear message |
-| server readiness polling | done (fixed 2 s poll, 120 s cap, raises) | `servers.wait_for_servers` |
+| startup validation: model files exist | done 2026-10-13 (servers that are not already running) | `Pipeline._validate_files` |
+| server readiness polling | done (2 s poll, 120 s per server, clean exit message) | `servers.wait_for_servers` |
 | per-service spoken failure phrases + restart | done | `phrases.py`, `Pipeline` recovery |
-| watchdog | partial: separate `make watch-servers` process; pipeline restarts a server only after a failed request | `servers.watchdog` |
+| watchdog | partial: separate `make watch-servers` process; pipeline restarts a server only after a failed request; neither spawns while the port is bound (2026-10-13) | `servers.watchdog`, `port_in_use` |
 | TTS self-trigger reduction | done (AEC + coupling gate), real-room unverified | §7 |
 | replayable debugging | done | `replay_stt.py`, `replay_pipeline.py`, `tests/e2e/replay.py` |
-| memory window, repeat, instant intents | done; a spoken "I don't remember that" path was **not** built (judged low value) | `textutils.py` |
+| memory window, repeat, instant intents | done; a spoken "I don't remember that" path was **not** built (no decision was recorded either way) | `textutils.py` |
 | barge-in polish, earcons | done | §7 |
 | graceful shutdown | done (SIGTERM, mic/speaker closed) | `Pipeline.stop` |
 | config profiles (`PROFILE`), `make diag` | **open** | – |
@@ -279,17 +297,16 @@ instrumentation / reliability / turn-taking goals are met by the work above). St
 | 30-minute multi-turn stability run | **open** (only a 90 s idle-noise soak exists) | `idle_soak` |
 | edge-hardware measurement plan | **open** | – |
 
-Open items, in the order that most improves robustness:
-1. **Mic hot-unplug / re-enumeration recovery.** Today a vanished USB mic gives endless `mic read failed` and a
-   silent assistant (§9). Re-open by name with backoff and say so ("I lost my microphone").
-2. **Model/file validation at start** with a spoken + printed reason, so a wrong path is not a cryptic server crash.
-3. **Long-session soak with real turns** (30 min, 20–30 interactions): watch RSS, thread count, open fds, trace
-   size, AEC drift; add it as an E2E `soak` scenario.
-4. **Real-hardware acoustic check** of the AEC and barge-in on loudspeakers (§5); everything so far used a simulated
-   room or a headset.
-5. **Always-on watchdog inside the pipeline** (health ping every ~60 s), plus a spoken startup health summary.
-6. **Language consistency for the German-tutor mode** (see the end of §8): multilingual Whisper, German voice and
-   phrase cache, intent/hallucination lists.
+Open items, in the order that most improves robustness (updated 2026-10-13 after the fixes in §12):
+1. **Real-hardware verification.** Microphone loss/reopen (F17), the pause-then-confirm barge-in, PortAudio stop
+   latency and the echo canceller have only been exercised against the simulated room and a fake backend.
+2. **German-tutor language stack** (F1): multilingual Whisper installed and selected, a German TTS voice (Kokoro
+   v1.0 has none), German phrase cache, German hallucination list. Only intents and a startup warning exist.
+3. **Real echo-cancellation measurement**: cancellation of the echo component alone, with simulator ground truth;
+   today's ERLE is bounded by the noise floor (§12.2).
+4. **Long-session soak with real turns** (30 min, 20–30 interactions): RSS, thread count, open fds, trace size.
+5. **Always-on watchdog inside the pipeline** and a spoken startup health summary.
+6. **Held-out real recordings** for the STT-confidence and barge-in thresholds (F5).
 7. Config profiles, `make diag`, a systemd/launch script and an edge-device measurement protocol, when a target
    device exists.
 
@@ -300,8 +317,8 @@ history. The findings text had been appended to README.md by mistake, which dupl
 ## 11. Critical review of 2026-10-13
 
 Scope: the whole uncommitted `repurpose_as_german_tutor` working tree (code, tests and these docs), reviewed by
-reading the code, running the unit tests and probing the text logic. Each finding has an ID; the *status* column is
-updated by the commit that fixes it (see §12). Nothing below was known to be wrong when the docs in §1–§10 were
+reading the code, running the unit tests and probing the text logic. Each finding has an ID; what was done about each one,
+and what did not work, is in §12. Nothing below was known to be wrong when the docs in §1–§10 were
 written; several statements in those sections are corrected in §12.
 
 ### 11.1 The product does not do what it claims
@@ -345,6 +362,7 @@ written; several statements in those sections are corrected in §12.
 | F25 | `serve_gemma.sh` sets no `-c` / `-np` | explicit, overridable context size and single slot |
 | F26 | `wait_for_servers` shares one deadline for three servers and aborts with a traceback | per-server deadline, clean message |
 | F27 | open work from §10: model-file validation at start | validate files of servers that are not running |
+| F28 | (added during the fix work) simulated echo only reaches ≈ 9–11 dB ERLE, suggesting a weak or misaligned filter | **retracted** — ERLE is bounded by the room noise floor, see §12.2 |
 
 ### 11.4 Faults in the documentation itself
 
@@ -356,4 +374,101 @@ written; several statements in those sections are corrected in §12.
 | D4 | §7 "stopping an answer is cheap to undo" is false: nothing resumed it | replace with the pause/resume design (F11) |
 | D5 | §4 "37 scenarios, 0 failed" (F2) | replace with the re-run result |
 | D6 | every entry is dated 2026-10-08 from file mtimes; it says when a change landed, not when the lesson was learned | state this once, keep dates |
+
+## 12. Fixes applied for the 2026-10-13 review
+
+All dated 2026-10-13. Unit tests: 137 pass (`make test-unit`, 73 new). The E2E result of the final code is in §12.3.
+
+### 12.1 What changed
+
+| ids | change | files | verified by |
+|---|---|---|---|
+| F7 | junk list compared on the normalised form and with plain acknowledgements excluded; a confident stop/sleep intent beats the junk list ("Bye." after a goodbye is a goodbye, not whisper noise) | `pipeline/textutils.py`, `pipeline/assistant_pipeline.py::_is_noise` | `test_review_fixes_text.py` |
+| F8 | `classify_intent(..., awaiting_answer=)`: yes/okay/no/sure over a reply that ended in "?" are answers, not "stop" | `textutils.py`, pipeline `_awaiting_answer` | unit tests |
+| F9 | time/date patterns anchored to the whole utterance (only polite/temporal tails allowed) | `textutils.py` | unit tests |
+| F10 | `Utterance.wakeish`; wake phrase stripped only for captures that contained it; endpoint logic moved to the pure `textutils.endpoint_class` and shares that rule | `textutils.py`, pipeline | unit tests |
+| F1 | German stop / goodbye / thanks / greeting / repeat / time / date intents and German cut-ins and dangling words; startup `LANGUAGE STACK` warning when prompt, Whisper model/language and TTS disagree. **Not solved:** a multilingual Whisper model must be installed by the user and Kokoro v1.0 has no German voice | `textutils.py`, pipeline `_check_language_stack` | unit tests; startup log |
+| F11, F22 | `Speaker.pause()/resume()`: fade out in one 20 ms chunk, hold position, nothing discarded; `stop()` clears pause and duck; ducking is carried across items instead of reset to 1.0; unresolved pause continues after `BARGE_IN_PAUSE_TIMEOUT_S`. Barge-in over answer audio pauses and starts an "interject" capture; `_confirm_interject` resumes on noise, stops on a muffled short word, stops-and-answers on speech | `audio/speaker.py`, pipeline | `test_speaker.py`; E2E `barge_in_*`, `non_word_over_answer_resumes` |
+| F12 | AEC delay estimation re-armed after ≈ 18 s of far-end audio instead of staying bypassed forever | `audio/aec.py` | `test_aec.py` |
+| F13 | `EchoCanceller.trusted` (latched like `converged`) + `AEC_TRUSTED_ERLE_DB`. **Default kept at 8 dB (= no behaviour change)** — see §12.2 and the latch story in §6 | `audio/aec.py`, config | E2E |
+| F14 | Silero streaming state reset at the start of a barge-in session and of each follow-up trigger run | pipeline | – (covered by E2E only) |
+| F15 | `port_in_use()`: never spawn a server while its port is bound (pipeline recovery and watchdog); server output logged to `debug_logs/server_<name>.log` | `common/servers.py`, pipeline | `test_servers_devices.py` |
+| F16 | `SERVERS` built from `LLM/STT/TTS_SERVER_URL` | `common/servers.py` | unit test |
+| F26 | per-server startup deadline; clean message + exit instead of a traceback | `common/servers.py`, pipeline | – |
+| F17 | `PyAudioMic` counts consecutive failures, reopens by name every 2 s, calls `on_status("lost"/"restored")`; pipeline says "I lost my microphone…" / "My microphone is back." from the phrase cache | `audio/mic.py`, `tts/phrases.py`, pipeline | – (needs a real unplug) |
+| F18 | `DEBUG_SAVE_WAV` default off, pruned to `DEBUG_MAX_WAVS`; trace / turn log / console redact transcripts and responses unless `LOG_TRANSCRIPTS=1` (the E2E harness sets it) | config, pipeline | E2E (evaluator still reads text) |
+| F19 | turn log write failure is logged, not raised from `finally` | pipeline | – |
+| F21 | interrupted answers are remembered as the spoken text followed by " …" instead of a bracketed marker | pipeline | – |
+| F23 | new unit tests: text fixes, speaker pause/resume/stop/duck, barge-in confirm decisions with a stubbed STT, LLM client against a fake SSE server (stream, error, first-token timeout, stall, cancel hangs up), servers/devices, AEC re-arm and trust latch | `tests/unit/` | 137 pass |
+| F24, F25 | `serve_gemma.sh`: `--ctx-size ${LLM_CTX:-4096}`, `--parallel ${LLM_PARALLEL:-1}` (llama.cpp's defaults are "from the model" and "auto"; checked with `llama-server --help`), model/binary/port overridable; `serve_whisper.sh` binary/port overridable; `netcat-openbsd` added to `install-system` | scripts, Makefile | `bash -n`; takes effect on next server start |
+| F27 | `_validate_files()`: missing Whisper/Kokoro files are reported before start for servers that are not already running | pipeline | – |
+| F20 | unchanged by design: a newer capture replaces an unprocessed older one (traced as `utterance_replaced`) | – | – |
+| D1–D6 | §6, §7, §10 corrected as described in §11.4 | this file | – |
+
+### 12.2 What did not work, and what the review itself got wrong
+
+* **F13 was a wrong diagnosis.** Raising the "trusted" ERLE threshold from 8 to 12 dB made `barge_in_through_echo`
+  fail (a real "Stop!" over echo was never detected): in the simulated room ERLE hovers at 6–11 dB, so the cautious
+  margin (×1.6 level, ×2 duration) never switched off. ERLE is measured against everything in the microphone,
+  including the room's noise floor (0.003–0.008 RMS in the scenarios), so it is *bounded by the noise*, not a measure
+  of filter quality. The real guard is the residual-based echo floor in the barge-in detector. The review's F28
+  ("AEC only reaches ≈ 9 dB, probably misaligned") is therefore **not established**; the correct statement is "ERLE as
+  logged cannot distinguish a weak filter from a noisy room". A proper measurement (cancellation of the echo
+  component only, with ground truth from the simulator) is open work.
+* **The E2E scenario `barge_in_stop` measured the wrong thing after F11.** It took the end of the audio item as
+  "fell silent"; with pause-then-confirm the item ends when STT has decided (≈ 1.5 s) although the room was silent
+  after ≈ 0.2 s. The check now uses the `speaker_pause` / `speaker_stop` event (+ 60 ms fade), and accepts either
+  an intent-level stop or a muffled-word stop. That is a change of the test, made because the observable behaviour
+  changed on purpose; it is recorded here so it is not mistaken for moving a goalpost silently.
+* **F10 introduced a regression that only E2E caught.** Restricting wake-phrase stripping to captures flagged
+  `wakeish` broke `barge_in_with_wake_phrase`: "Hey Jarvis, stop." said over an answer is an *interject* capture, and
+  wake detection only ran for follow-up captures, so the text reached the LLM unstripped ("I am not Jarvis…"). Fixed
+  twice over: wake detection now also runs in interject captures, and a **strict** strip (explicit "hey/hi/okay/hello"
+  + the name) is applied to every capture that was not flagged, so a stop with a spoken wake phrase never depends on
+  the wake model having heard it. Unit tests cover the strict form ("Service animals…" is left alone).
+* **`non_word_over_answer_resumes` assumed what Whisper hears.** It expected "Hmm." to be transcribed as noise;
+  tiny.en heard "Come in.", which the (documented) rule "a brief unrecognised word over our answer is a stop" turned
+  into a silent stop — correct behaviour, wrong test. The scenario became `non_word_over_answer_resolves` (a pause
+  must be resolved by resume or stop, and the sound must never reach the LLM), and the resume / muffled-stop /
+  speech decisions are covered deterministically in `tests/unit/test_barge_in_confirm.py` with a stubbed STT.
+* **A first full run was discarded.** It was started before the F13 revert; it showed 3 failing checks in 2
+  scenarios (`barge_in_stop`, `barge_in_through_echo`) at the time it was stopped; a second full run (36/38, with
+  `barge_in_with_wake_phrase` and the Hmm scenario failing, both described above) was replaced as well, so the
+  table in §12.3 is the run of the code that is committed.
+* **Limitations that cannot be fixed in this repository** (F4–F6): the simulated user is the same TTS engine as the
+  assistant, the echo path is delay + gain, and the thresholds were tuned on the scenarios that evaluate them.
+  Confidence in real rooms needs real recordings (`tests/e2e/replay.py`) and a loudspeaker session with the
+  Jabra unplugged. "0 of 9 echo runs" bounds the failure rate only to ≈ 28 % (95 %); do not read more into it.
+
+### 12.3 Results of the code that is committed
+
+Run `reports/e2e/20261013_010834` (full suite, 38 scenarios, final code; the report folders are git-ignored, the
+numbers are copied here): **37 of 38 scenarios without a hard failure; 1 failed check; 1 expected warning.**
+
+| item | result |
+|---|---|
+| `speaker_echo` | 1 failed check: *no self-interruption from own voice — 1 barge-in*. The trace shows the new design absorbing it: echo triggered a pause at 13.4 s, STT/endpoint found no speech, the answer resumed after 1.8 s and completed (before F11 the answer would have been killed). It is still an audible 1.8 s gap, so it counts. Repeat ×8: 8/8 pass on this code, 8/8 on the pre-fix commit; 1 failure in 9 runs of the final code overall. Not distinguishable from a rare pre-existing flake (95 % upper bound on the failure rate ≈ 30 %) |
+| `speaker_echo_without_aec` | warning, as designed (baseline shows what AEC buys); its "settles to idle" checks are warnings since the baseline is a self-feeding loop (`allow_unsettled`) |
+| `barge_in_through_echo` | 5/5 pass in the final repeat. Before the `trusted` latch fix: 2 failures in 7 runs (pre-change commit: 0 of 6) — see §6 |
+| `wake_in_one_breath` | 5/5 without hard failure, 3 warnings; one earlier run failed on STT hearing "2 plus 3" as "Topless 3" / "Top Boss 3" (tiny.en). Model quality, not pipeline |
+| everything else (34 scenarios) | pass |
+
+Timing, measured from the end of the user's audio (same method as §4; clips carry ≈ 150 ms of trailing TTS pad):
+
+| metric | 2026-10-08 (§4) | 2026-10-13 |
+|---|---|---|
+| end of speech detected, median | 0.81 s | 0.82 s |
+| first word of a normal answer, median | 2.1 s | 2.1 s |
+| slow model (12 s TTFT) first word, max | 18 s | 16.5 s |
+| time until the room is silent after "stop" starts | 0.40 s | 0.39 s (pause + 60 ms fade) |
+| max dead air in a normal turn | – | 4 s |
+
+Run history of this review, so the table above can be audited: (1) full run with the 12 dB trust threshold —
+stopped at 29/37, `barge_in_stop` and `barge_in_through_echo` failing; (2) full run after reverting it — 36/38,
+`barge_in_with_wake_phrase` (real regression from F10) and the Hmm scenario (wrong test) failing; (3) full run —
+35/38, `wake_in_one_breath` (STT), `barge_in_through_echo` (flaky, trust latch), baseline settle checks;
+(4) the committed code — above. The unit suite is 137 tests, ~12 s.
+
+What this does **not** show: nothing here ran on a real microphone/loudspeaker, with a real person, or with German
+speech. Items under §10 remain open for those reasons.
 

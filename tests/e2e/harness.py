@@ -63,6 +63,7 @@ class World:
         self.cfg = load_config()
         self.cfg.llm_system_prompt = ASSISTANT_PROMPT
         self.cfg.debug_save_wav = False
+        self.cfg.log_transcripts = True      # the evaluator judges what was said
         self.cfg.turnlogdir = str(out_dir / "turns")
         self.cfg.tts_output_dir = str(ROOT / "debug_audio")
         if llm_url:

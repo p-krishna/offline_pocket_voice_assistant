@@ -29,6 +29,9 @@ class Scenario:
     proxy: dict = field(default_factory=lambda: {"mode": "pass"})
     tags: tuple = ("core",)
     allow_errors: bool = False
+    # Deliberately pathological set-ups (a baseline that is *expected* to talk to itself) cannot be required
+    # to settle into idle within the scenario: those two end-state checks become warnings.
+    allow_unsettled: bool = False
 
 
 class Ctx:
@@ -40,9 +43,9 @@ class Ctx:
 REGISTRY: Dict[str, Scenario] = {}
 
 
-def scenario(name, description, world=None, proxy=None, tags=("core",), allow_errors=False):
+def scenario(name, description, world=None, proxy=None, tags=("core",), allow_errors=False, allow_unsettled=False):
     def deco(fn):
-        REGISTRY[name] = Scenario(name, description, fn, world or {}, proxy or {"mode": "pass"}, tags, allow_errors)
+        REGISTRY[name] = Scenario(name, description, fn, world or {}, proxy or {"mode": "pass"}, tags, allow_errors, allow_unsettled)
         return fn
     return deco
 

@@ -48,7 +48,7 @@ from common import stamp
 from common.config import load_config
 from common.event_logger import logger
 from common.log import get_logger, now_s, trace
-from common.servers import SERVERS, _ping, _start, wait_for_servers
+from common.servers import SERVERS, _ping, _start, port_in_use, wait_for_servers
 from llm.gemma import GemmaLLM, LLMError, LLMTimeout
 from pipeline import textutils as tu
 from pipeline.speech import SpeechStreamer
@@ -79,6 +79,8 @@ class Utterance:
     text: Optional[str] = None         # pre-transcribed (interjections are transcribed before they cancel a turn)
     stt: Optional[STTResult] = None    # confidence of the transcript when it is known
     stt_future: Optional[Future] = None  # speculative transcript started while the user was still in the silence hold
+    wakeish: bool = False              # the capture contained the wake phrase (only then is it stripped from the text)
+    paused: bool = False               # our answer is paused (not stopped) until this speech is judged
 
 
 @dataclass
@@ -94,6 +96,7 @@ class Capture:
     heard: bool = False
     wake_score: float = 0.0
     wakeish: bool = False              # the wake phrase was heard in this capture
+    paused: bool = False               # started by speech over our answer, which is paused meanwhile
     speech_sq: float = 0.0             # for the user's typical speaking level
     speech_frames: int = 0
     spec: Optional["Spec"] = None      # speculative STT in flight / done
@@ -224,6 +227,7 @@ class Pipeline:
         if self.cfg.aec_enabled:
             self.aec = EchoCanceller(block=self.webrtc.frame_samples, partitions=self.cfg.aec_partitions,
                                      mu=self.cfg.aec_mu, sr=self.cfg.sample_rate,
+                                     trust_db=self.cfg.aec_trusted_erle_db,
                                      ref=ReferenceBuffer(self.cfg.sample_rate))
         self._stt_pool: Optional[ThreadPoolExecutor] = None
         self._server_procs: dict = {}
@@ -247,6 +251,13 @@ class Pipeline:
             return None
         pcm, sr = got
         return self.speaker.enqueue(AudioItem("phrase", pcm, sr, label=key, epoch=epoch))
+
+    def _pii(self, text: str, limit: Optional[int] = None) -> str:
+        """What the user said / we answered, for logs and traces: redacted unless LOG_TRANSCRIPTS=1."""
+        text = text if limit is None else text[:limit]
+        if self.cfg.log_transcripts:
+            return text
+        return f"<{len(text)} chars>" if text else ""
 
     @staticmethod
     def _rms(frames: list) -> float:
@@ -282,14 +293,23 @@ class Pipeline:
             wf.writeframes(np.concatenate(samples).astype(np.int16).tobytes())
         log.debug("debug wav saved: %s", path)
         self._last_debug_wav = path
+        try:                                   # keep only the newest DEBUG_MAX_WAVS recordings
+            old = sorted(out_dir.glob(f"{prefix}_*.wav"), key=lambda q: q.stat().st_mtime)[:-max(1, self.cfg.debug_max_wavs)]
+            for q in old:
+                q.unlink()
+        except OSError as e:
+            log.debug("debug wav pruning failed: %s", e)
         return path
 
     def _log_turn(self, turn_data: dict) -> None:
         """One JSON line per turn in a daily JSONL file."""
-        log_dir = Path(self.cfg.turnlogdir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / f"turns_{time.strftime('%Y-%m-%d')}.jsonl", "a") as f:
-            f.write(json.dumps(turn_data) + "\n")
+        try:
+            log_dir = Path(self.cfg.turnlogdir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / f"turns_{time.strftime('%Y-%m-%d')}.jsonl", "a") as f:
+                f.write(json.dumps(turn_data) + "\n")
+        except OSError as e:               # telemetry must never break (or mask the outcome of) a turn
+            log.warning("turn log not written: %s", e)
 
     def _enqueue_utterance(self, utt: Utterance) -> None:
         """Newest utterance wins: if one is still waiting unprocessed, replace it."""
@@ -310,13 +330,10 @@ class Pipeline:
     # ------------------------------------------------------------------
     # Endpointing helpers
     # ------------------------------------------------------------------
-    # A sentence cannot end on these: the speaker is mid-thought even if STT added a full stop.
-    _DANGLING = {"and", "or", "but", "because", "the", "a", "an", "to", "of", "with", "for", "my", "your",
-                 "if", "then", "like", "um", "uh", "from", "by"}
     # Short follow-ups that really are questions when said over the assistant.
     _SHORT_QUESTIONS = {"why", "what", "how", "who", "when", "where", "which", "really", "huh", "pardon",
-                        "again", "more", "sorry", "continue", "go on", "and", "so", "meaning", "explain"}
-    _DANGLING_UNLESS_QUESTION = {"about", "is", "are", "was", "that", "it", "this", "there"}
+                        "again", "more", "sorry", "continue", "go on", "and", "so", "meaning", "explain",
+                        "warum", "was", "wie", "wer", "wann", "wo", "wieso", "bitte"}
 
     def _spec_transcribe(self, frames) -> Optional[STTResult]:
         try:
@@ -346,25 +363,13 @@ class Pipeline:
         except Exception:
             return hold
         raw = res.text if res is not None else None
-        if raw is None or tu.is_hallucination(raw):
-            # Right after the wake word the "speech" is often just a fragment of it that
-            # whisper cannot read: stay patient, the request is probably still coming.
-            return float(cfg.utterance_wake_hold_ms) if cap.wakeish else hold
-        text = tu.clean_transcript(raw)
-        core = tu.strip_wake_phrase(text, cfg.wakeword)
-        if not core:                      # nothing but the wake phrase so far
+        kind = tu.endpoint_class(raw, cfg.wakeword, cap.wakeish)
+        if kind == "wake_wait":
             return float(cfg.utterance_wake_hold_ms)
-        words = core.lower().split()
-        last = words[-1].strip(".,?!;:") if words else ""
-        stripped = text.rstrip()
-        if stripped.endswith("?") and len(words) >= 1:
+        if kind == "question":
             return float(cfg.utterance_early_hold_ms)
-        if stripped.endswith((",", "-", "…", "...")) or last in self._DANGLING:
+        if kind == "hesitation":
             return float(cfg.utterance_hesitation_hold_ms)
-        if last in self._DANGLING_UNLESS_QUESTION and not stripped.endswith((".", "!")):
-            return float(cfg.utterance_hesitation_hold_ms)
-        if stripped.endswith((".", "?", "!")) and len(words) >= 2:
-            return float(cfg.utterance_early_hold_ms)
         return hold
 
     # ------------------------------------------------------------------
@@ -427,10 +432,11 @@ class Pipeline:
         def silero_reset():
             self.silero.reset()
 
-        def start_capture(source: str, seed: List[np.ndarray], wake_score: float = 0.0) -> None:
+        def start_capture(source: str, seed: List[np.ndarray], wake_score: float = 0.0, paused: bool = False) -> None:
             nonlocal cap
             silero_reset()
-            cap = Capture(source=source, t_start=time.monotonic(), wake_score=wake_score, wakeish=(source == "wake"))
+            cap = Capture(source=source, t_start=time.monotonic(), wake_score=wake_score, wakeish=(source == "wake"),
+                          paused=paused)
             self.wake.hits = 0
             trace.emit("capture_start", source=source, seed_ms=round(len(seed) * fms))
             for fr in seed:
@@ -442,7 +448,7 @@ class Pipeline:
             c.frames.append(fr)
             c.ms += fms
             c.sbuf = np.concatenate([c.sbuf, fr])
-            if c.source == "followup" and not c.wakeish:
+            if c.source in ("followup", "interject") and not c.wakeish:
                 # The wake phrase also works while the conversation is open: it changes how
                 # patient we are afterwards ("Hey Jarvis … [pause] … question").
                 sc = self.wake.model.predict(fr).get(cfg.wakeword, 0.0)
@@ -486,6 +492,10 @@ class Pipeline:
                 self._m_false_wakes += 1
                 log.info("capture rejected (%s, %s): %.0fms audio, %.0fms speech, rms=%.4f",
                          c.source, reason, c.ms, c.speech_ms, rms)
+                if c.paused:
+                    # Whatever interrupted our answer was not speech: carry on where we left off.
+                    self.speaker.resume("capture_rejected")
+                    trace.emit("barge_in_noise", why=reason)
                 if c.source == "wake":
                     # Woke up but nobody spoke: say nothing more, go back to sleep quietly.
                     self.conversation_mode.clear()
@@ -503,7 +513,8 @@ class Pipeline:
                 lvl = (c.speech_sq / c.speech_frames) ** 0.5
                 self._user_level = lvl if self._user_level is None else 0.5 * self._user_level + 0.5 * lvl
             utt = Utterance(frames, c.source, c.speech_ms, rms, t_eos, time.monotonic(), c.wake_score,
-                            stt_future=c.spec.fut if c.spec else None)
+                            stt_future=c.spec.fut if c.spec else None, wakeish=c.wakeish or c.source == "wake",
+                            paused=c.paused)
             if c.source == "interject":
                 threading.Thread(target=self._confirm_interject, args=(utt,), name="Interject", daemon=True).start()
                 return
@@ -571,7 +582,7 @@ class Pipeline:
                 # Speculative STT: transcribe while the silence hold is still running.
                 if cap.spec is not None and cap.spec.last_speech_ms != cap.last_speech_ms:
                     cap.spec = None                 # user resumed talking → stale
-                if (cap.spec is None and silence_ms >= cfg.speculative_stt_ms and cap.source != "interject"
+                if (cap.spec is None and silence_ms >= cfg.speculative_stt_ms and (cap.source != "interject" or cap.paused)
                         and self._stt_pool is not None):
                     # Exactly the audio finish_capture() would send (speech + post-roll of silence),
                     # so the speculative transcript is the transcript of the final utterance.
@@ -590,6 +601,7 @@ class Pipeline:
                 if bi_session_start is None:
                     bi_session_start = t
                     reset_barge()
+                    silero_reset()      # the model is streaming: do not carry state over from unrelated audio
                 level = sp.recent_level()
                 # Calibration window: the first ~0.45 s after our audio (re)starts being audible.
                 # We learn the speaker→mic coupling there and never barge-in on it.
@@ -612,7 +624,7 @@ class Pipeline:
                     continue            # still learning how loud our own voice is at the mic
 
                 # Until the echo canceller has converged, demand a larger margin over the learned echo.
-                cautious = (self.aec is not None and not self.aec.converged and self._echo_ratio > 0.03)
+                cautious = (self.aec is not None and not self.aec.trusted and self._echo_ratio > 0.03)
                 margin = cfg.interrupt_echo_margin * (1.6 if cautious else 1.0)
                 echo_floor = self._echo_ratio * level * margin
                 loud_enough = rms_now >= max(cfg.interrupt_energy_threshold, 2.5 * noise_floor, echo_floor)
@@ -652,21 +664,23 @@ class Pipeline:
                                echo_floor=round(echo_floor, 4), speaker_kind=sp_kind,
                                turn_active=self.turn_active.is_set(),
                                erle_db=round(self.aec.erle_db, 1) if self.aec else None,
-                               mode="stop" if sp_kind == "tts" else "interject")
+                               mode="pause" if sp_kind == "tts" else "interject")
                     log.info("BARGE-IN (rms=%.4f, speaker=%s, mode=%s)", rms, sp_kind,
-                             "stop" if sp_kind == "tts" else "interject")
+                             "pause" if sp_kind == "tts" else "interject")
                     seed = list(bi_frames)
-                    sp.set_duck(1.0)
-                    # Talking over actual answer audio → stop it now. Over silence/filler
-                    # ("thinking" phase) → only record; STT must confirm real speech
-                    # before the pending answer is cancelled (a cough must not kill it).
-                    mode = "stop" if sp_kind == "tts" else "interject"
-                    if mode == "stop":
-                        sp.stop("barge_in")
+                    # Talking over answer audio → silence it *now* but only pause it: whether this was a
+                    # request, "stop" or a cough is decided by STT afterwards (resume / stop). Over silence or
+                    # filler ("thinking" phase) there is nothing to pause; the pending answer is cancelled
+                    # only once STT has confirmed real speech.
+                    paused = sp_kind == "tts"
+                    if paused:
+                        sp.pause("barge_in")
+                    else:
+                        sp.set_duck(1.0)
                     reset_barge()
                     bi_session_start = None
                     warned = False
-                    start_capture("barge" if mode == "stop" else "interject", seed)
+                    start_capture("interject", seed, paused=paused)
                 continue
             bi_session_start = None
             playing_prev = False
@@ -694,6 +708,8 @@ class Pipeline:
                     # Ignore anything much quieter than the user's own voice (TV, other rooms).
                     trigger_rms = max(trigger_rms, cfg.followup_level_ratio * self._user_level)
                 if is_speech and rms_now >= trigger_rms:
+                    if reentry_hits == 0:
+                        silero_reset()
                     reentry_hits += 1
                     # Confirm with Silero so door slams / claps / chair noises don't open a capture.
                     reentry_buf = np.concatenate([reentry_buf, frame])
@@ -800,25 +816,67 @@ class Pipeline:
                 if self.utterance_queue.empty():
                     self.turn_active.clear()
 
+    def _awaiting_answer(self) -> bool:
+        """The assistant's last reply ended in a question, so "yes"/"okay"/"no" over it are answers."""
+        return tu.ends_with_question(self._last_response)
+
+    def _is_noise(self, raw: Optional[str], res: STTResult, cut_in: bool) -> bool:
+        """
+        True when the transcript carries no real speech. A confident stop/sleep intent always counts as
+        speech, even for words whisper also hallucinates on silence ("Bye.").
+        """
+        text = tu.clean_transcript(raw or "")
+        if not text:
+            return True
+        if tu.is_hallucination(raw):
+            core = tu.strip_wake_phrase(text, self.cfg.wakeword, strict=True)
+            intent = tu.classify_intent(core, barge=cut_in, awaiting_answer=self._awaiting_answer())
+            return not (intent in ("stop", "sleep") and res.confident(self.cfg.stt_min_logprob))
+        return False
+
     def _confirm_interject(self, utt: Utterance) -> None:
-        """User spoke while the assistant was still thinking. Only if STT hears real
-        speech do we cancel the pending answer and treat this as the next request."""
+        """
+        The user spoke while the assistant was thinking, or while its answer was paused. Decide, from STT,
+        whether it was real speech:
+          noise        → resume the paused answer / keep the pending one
+          muffled word → (only when we paused an answer) it almost always means "stop": stop, say nothing
+          speech       → stop the current answer and treat this as the next request
+        """
+        cfg = self.cfg
+        sp = self.speaker
         try:
-            res = self.stt.transcribe_ex(utt.samples, self.cfg.sample_rate)
+            res = self._get_transcript(utt)
         except Exception as e:
             log.warning("interjection STT failed: %s", e)
+            if utt.paused:
+                sp.resume("interject_stt_failed")
             return
         raw = res.text
-        if tu.is_hallucination(raw) or not tu.clean_transcript(raw or "") or (
-                not res.confident(self.cfg.stt_min_logprob)
-                and tu.classify_intent(tu.strip_wake_phrase(raw or ""), barge=True) is None):
-            trace.emit("interject_rejected", raw=(raw or "")[:60])
-            log.info("interjection was noise (%r) — keeping the pending answer", raw)
+        core = tu.strip_wake_phrase(tu.clean_transcript(raw or ""), cfg.wakeword, strict=not utt.wakeish)
+        intent = tu.classify_intent(core, barge=True, awaiting_answer=self._awaiting_answer())
+        if self._is_noise(raw, res, cut_in=True):
+            trace.emit("interject_rejected", raw=self._pii(raw or "", 60))
+            log.info("interjection was noise (%s) — keeping the answer", self._pii(raw or "", 60))
+            if utt.paused:
+                sp.resume("interject_noise")
             return
+        if intent is None and not res.confident(cfg.stt_min_logprob):
+            if utt.paused and utt.speech_ms < 1400:
+                # A muffled short word over our answer ("Snobber." for "stop"): obey it, do not guess a request.
+                trace.emit("interject_confirmed", text=self._pii(raw or "", 80), as_="stop_unclear")
+                log.info("unclear short cut-in → stop")
+                sp.stop("interject_unclear")
+                self._m_interrupt_detected += 1
+                self._m_interrupt_success += 1
+                return
+            if not utt.paused:
+                trace.emit("interject_rejected", raw=self._pii(raw or "", 60))
+                log.info("unclear interjection while thinking — keeping the pending answer")
+                return
         utt.text, utt.stt = raw, res
-        trace.emit("interject_confirmed", text=raw[:80])
-        log.info("interjection confirmed: %r → cancelling current turn", raw)
-        self.speaker.stop("interject")
+        trace.emit("interject_confirmed", text=self._pii(raw or "", 80))
+        log.info("interjection confirmed: %s → cancelling current turn", self._pii(raw or "", 80))
+        sp.stop("interject")
         self._enqueue_utterance(utt)
 
     def _get_transcript(self, utt: Utterance) -> STTResult:
@@ -882,17 +940,21 @@ class Pipeline:
                 return
             stt_ms = (time.monotonic() - t0) * 1000
             transcript = tu.clean_transcript(raw or "")
-            trace.emit("stt_done", turn=turn, ms=round(stt_ms), raw=(raw or "")[:600], text=transcript[:600],
+            trace.emit("stt_done", turn=turn, ms=round(stt_ms), raw=self._pii(raw or "", 600),
+                       text=self._pii(transcript, 600),
                        logprob=None if stt_res.avg_logprob is None else round(stt_res.avg_logprob, 2),
                        min_word=None if stt_res.min_word_prob is None else round(stt_res.min_word_prob, 2))
-            log.info("STT (%.0fms): %r", stt_ms, raw)
+            log.info("STT (%.0fms): %s", stt_ms, self._pii(raw or ""))
 
             if cancelled():
                 outcome = "cancelled"
                 return
 
-            core = tu.strip_wake_phrase(transcript, cfg.wakeword)
-            if tu.is_hallucination(raw) or not transcript:
+            cut_in = utt.source in ("barge", "interject")
+            # Only a capture that contained the wake phrase has it stripped: "Service animals in Germany…"
+            # said as a follow-up must reach the model intact.
+            core = tu.strip_wake_phrase(transcript, cfg.wakeword, strict=not utt.wakeish)
+            if self._is_noise(raw, stt_res, cut_in):
                 self._m_blank_stt += 1
                 outcome = "blank"
                 narrator.stop()
@@ -909,13 +971,12 @@ class Pipeline:
                 return
 
             # ── Intents ──────────────────────────────────────────────────
-            cut_in = utt.source in ("barge", "interject")
-            intent = tu.classify_intent(core, barge=cut_in)
+            intent = tu.classify_intent(core, barge=cut_in, awaiting_answer=self._awaiting_answer())
             if intent is None and not stt_res.confident(cfg.stt_min_logprob):
                 # whisper itself does not believe this transcript ("Snobber."): don't feed garbage to the LLM.
                 narrator.stop()
-                trace.emit("stt_unclear", turn=turn, text=core[:80], logprob=stt_res.avg_logprob)
-                log.info("unclear transcript %r (logprob=%.2f) → not answering it", core, stt_res.avg_logprob or 0.0)
+                trace.emit("stt_unclear", turn=turn, text=self._pii(core, 80), logprob=stt_res.avg_logprob)
+                log.info("unclear transcript %s (logprob=%.2f) → not answering it", self._pii(core), stt_res.avg_logprob or 0.0)
                 if cut_in and utt.speech_ms < 1400:
                     outcome = "stop"             # a muffled word over the assistant almost always means "stop"
                 elif utt.source == "wake" and utt.speech_ms < 1300:
@@ -929,7 +990,7 @@ class Pipeline:
                     and core.lower().strip(" .?!,") not in self._SHORT_QUESTIONS):
                 # A brief unrecognised word over the assistant ("Snava." for "stop") is a stop, not a request.
                 intent = "stop"
-                trace.emit("stt_short_cut_in", turn=turn, text=core[:40], logprob=stt_res.avg_logprob)
+                trace.emit("stt_short_cut_in", turn=turn, text=self._pii(core, 40), logprob=stt_res.avg_logprob)
             if intent:
                 trace.emit("intent", turn=turn, name=intent)
                 log.info("intent: %s", intent)
@@ -987,7 +1048,7 @@ class Pipeline:
                         first_chunk_seen = True
                         narrator.stop()
                         trace.emit("first_chunk", turn=turn, since_eos_ms=round((time.monotonic() - utt.t_eos) * 1000),
-                                   text=ch[:80])
+                                   text=self._pii(ch, 80))
                     speech.submit(ch)
 
             if fast:
@@ -1019,8 +1080,8 @@ class Pipeline:
                 trace.emit("llm_done", turn=turn, ms=round(llm_ms), tokens=self.llm.last_tokens,
                            finish=self.llm.last_finish_reason, chars=len(response),
                            error=str(llm_error) if llm_error else None)
-                log.info("LLM (%.0fms, %d tok, %s): %r", llm_ms, self.llm.last_tokens,
-                         self.llm.last_finish_reason, response[:120])
+                log.info("LLM (%.0fms, %d tok, %s): %s", llm_ms, self.llm.last_tokens,
+                         self.llm.last_finish_reason, self._pii(response, 120))
 
             narrator.stop() if (first_chunk_seen or llm_error) else None
             speech.finish()
@@ -1052,7 +1113,8 @@ class Pipeline:
             # Memory: only remember what the user actually heard.
             remembered = response if outcome in ("completed",) or outcome.startswith("fast_") else spoken_text
             if outcome == "interrupted":
-                remembered = (tu.trim_for_memory(spoken_text, cfg.memory_assistant_max_chars) + " [interrupted]").strip()
+                # Only what was actually heard, with a plain ellipsis (a bracketed marker got fed back to the model).
+                remembered = (tu.trim_for_memory(spoken_text, cfg.memory_assistant_max_chars).rstrip(" .,;:") + " …").strip()
             if outcome in ("completed", "interrupted") or outcome.startswith("fast_"):
                 self.history.append({"role": "user", "content": core})
                 self.history.append({"role": "assistant",
@@ -1071,14 +1133,14 @@ class Pipeline:
                 first_audio_ms = round((speech.first_audio_t - utt.t_eos) * 1000)
             trace.emit("turn_end", turn=turn, outcome=outcome, total_ms=round(total_ms),
                        since_eos_ms=round(since_eos), first_audio_ms=first_audio_ms,
-                       stt_ms=round(stt_ms), llm_ms=round(llm_ms), transcript=transcript[:600],
-                       response=response[:600], spoken=spoken_text[:600], narration=narrator.events)
+                       stt_ms=round(stt_ms), llm_ms=round(llm_ms), transcript=self._pii(transcript, 600),
+                       response=self._pii(response, 600), spoken=self._pii(spoken_text, 600), narration=narrator.events)
             if cfg.metrics_enabled:
                 log.info("METRICS turn=%d outcome=%s stt=%.0fms llm=%.0fms first_audio=%sms total=%.0fms narration=%d",
                          turn, outcome, stt_ms, llm_ms, first_audio_ms, total_ms, narrator.events)
                 self._log_turn({
                     "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "turn": turn,
-                    "transcript": transcript, "response_chars": len(response),
+                    "transcript": self._pii(transcript), "response_chars": len(response),
                     "stt_ms": round(stt_ms, 1), "llm_ms": round(llm_ms, 1),
                     "total_ms": round(total_ms, 1), "first_audio_ms": first_audio_ms,
                     "interrupted": outcome == "interrupted", "failed": outcome.endswith("_error") or outcome == "llm_timeout",
@@ -1105,6 +1167,15 @@ class Pipeline:
             proc = self._server_procs.get(name)
             while time.monotonic() < deadline and self.running.is_set():
                 if proc is None or proc.poll() is not None:
+                    # Something we did not start (or a hung copy) may still own the port: never fight it.
+                    if port_in_use(srv):
+                        log.warning("%s port %d is bound but unhealthy — waiting, not spawning a second copy",
+                                    name, srv["port"])
+                        time.sleep(1.5)
+                        if _ping(srv["url"], timeout=3):
+                            trace.emit("server_restarted", name=name, spawns=spawns)
+                            break
+                        continue
                     if spawns >= 3:
                         break
                     proc = self._server_procs[name] = _start(srv)
@@ -1134,6 +1205,56 @@ class Pipeline:
                 print(f"[{stamp()}] Config error: duplicate port {port} in SERVERS")
                 sys.exit(1)
             seen.add(port)
+        self._validate_files()
+        self._check_language_stack()
+
+    def _on_mic_status(self, event: str) -> None:
+        """Called from the audio thread when the microphone disappears / comes back."""
+        trace.emit("mic_" + event)
+        if self.speaker is not None:
+            self._say("mic_lost" if event == "lost" else "mic_back")
+
+    def _validate_files(self) -> None:
+        """A wrong model path otherwise shows up as a server that silently never comes up."""
+        cfg = self.cfg
+        checks = [("STT", cfg.whisper_model, "WHISPER_MODEL"),
+                  ("TTS", cfg.kokoro_model_path, "KOKORO_MODEL_PATH"),
+                  ("TTS", cfg.kokoro_voices_path, "KOKORO_VOICES_PATH")]
+        by_name = {s["name"]: s for s in SERVERS}
+        missing = []
+        for srv_name, path, var in checks:
+            srv = by_name.get(srv_name)
+            if srv is not None and (_ping(srv["url"], timeout=1) or port_in_use(srv)):
+                continue                      # that server is already running: its files are its business
+            if path and not Path(path).exists():
+                missing.append((srv_name, var, path))
+        if missing:
+            for srv_name, var, path in missing:
+                print(f"[{stamp()}] Missing file for the {srv_name} server: {path}  (set {var})")
+            sys.exit(1)
+
+    def _check_language_stack(self) -> None:
+        """
+        The assistant's language is decided in four places that must agree: prompt, STT model/language,
+        TTS voice, cached phrases. Say loudly when they visibly do not (an English-only Whisper model
+        cannot transcribe German, whatever the prompt asks for).
+        """
+        cfg = self.cfg
+        model = Path(cfg.whisper_model).name.lower()
+        german = "german" in cfg.llm_system_prompt.lower() or "deutsch" in cfg.llm_system_prompt.lower()
+        problems = []
+        if model.endswith(".en.bin") and (cfg.whisper_language != "en" or german):
+            problems.append(f"STT model '{model}' is English-only but the assistant is configured for German; "
+                            f"use a multilingual model (WHISPER_MODEL=…/ggml-base.bin or small.bin, WHISPER_LANGUAGE=de|auto)")
+        if german and cfg.whisper_language == "en":
+            problems.append("WHISPER_LANGUAGE=en: German speech will be transcribed as English-sounding text")
+        if german:
+            problems.append(f"TTS voice '{cfg.tts_voice}' and the cached phrases are English; Kokoro v1.0 ships no "
+                            f"German voice, so German answers will be read with an English accent")
+        for p in problems:
+            log.warning("LANGUAGE STACK: %s", p)
+        if problems:
+            trace.emit("language_stack_warning", problems=problems)
 
     def start(self, wait_servers: bool = True) -> None:
         """Open devices, warm everything up and start the worker threads (non-blocking)."""
@@ -1146,17 +1267,23 @@ class Pipeline:
                  self.cfg.conversation_timeout_s)
         self._validate_config()
         if wait_servers:
-            wait_for_servers()
+            try:
+                wait_for_servers()
+            except RuntimeError as e:
+                print(f"[{stamp()}] {e}")
+                sys.exit(1)
         self.phrases.warm_up()
         threading.Thread(target=self.llm.warm_up, name="LLMWarmup", daemon=True).start()
 
         self._backend = self._backend or PyAudioBackend()
-        self.speaker = Speaker(self._backend, drain_extra_s=self.cfg.tts_drain_extra_s)
+        self.speaker = Speaker(self._backend, drain_extra_s=self.cfg.tts_drain_extra_s,
+                               pause_timeout_s=self.cfg.barge_in_pause_timeout_s)
         if self.aec is not None:
             self.speaker.taps.append(
                 lambda t_item, off, seg, sr, item, gains: self.aec.ref.push_queued(item, off, len(seg), sr, gains))
         self._mic = self._injected_mic or PyAudioMic(self.cfg, self.webrtc.frame_samples)
         self._mic.open()
+        self._mic.on_status = self._on_mic_status
 
         self._stt_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="SpecSTT")
         self.running.set()

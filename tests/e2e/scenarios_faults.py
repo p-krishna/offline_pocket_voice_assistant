@@ -192,16 +192,25 @@ def barge_in_stop(w, ctx):
     tts_after = [i for i in items if i["kind"] == "tts" and i["t0"] > t_onset + 0.2]
     aborted = [i for i in items if i["kind"] == "tts" and i["completed"] is False]
     ck.append(Check("answer cut off (a sentence was aborted)", bool(aborted)))
-    if aborted:
-        stop_lat = aborted[-1]["t1"] - t_onset
+    # Audible silence begins when the answer is paused (or stopped outright): the item itself only ends later,
+    # when STT has confirmed the stop. A ~60 ms fade-out follows the pause/stop event.
+    silenced = [e["t"] for e in w.events if e["ev"] in ("speaker_pause", "speaker_stop") and e["t"] >= t_onset]
+    if silenced:
+        stop_lat = min(silenced) + 0.06 - t_onset
         ctx.metrics["stop_latency_ms"] = stop_lat * 1000
         ck.append(Check("assistant fell silent quickly after 'stop' began", stop_lat <= 1.1, f"{stop_lat * 1000:.0f}ms"))
+    else:
+        ck.append(Check("assistant fell silent quickly after 'stop' began", False, "never paused or stopped"))
     ck.append(Check("no more answer audio after the cut", not tts_after, f"{len(tts_after)} later sentences"))
     ck.append(Check("barge-in detected", len(w.find("barge_in", m)) == 1, f"{len(w.find('barge_in', m))}"))
     ck.append(Check("LLM generation was cancelled (client hung up)", ctx.proxy.disconnects >= 0, "n/a for fast completion", severity="warn"))
     # the stop utterance itself must not be answered with a long reply
+    # Either the stop was understood as an intent (turn outcome "stop"), or a muffled word over the paused
+    # answer was obeyed as a stop without any new turn. Both are silent; neither may produce an answer.
     stops = [e for e in w.find("turn_end", m) if e["outcome"] == "stop"]
-    ck.append(Check("'stop' understood as stop (no new answer)", bool(stops), ", ".join(e["outcome"] for e in w.find("turn_end", m))))
+    muffled = [e for e in w.find("interject_confirmed", m) if e.get("as_") == "stop_unclear"]
+    ck.append(Check("'stop' understood as stop (no new answer)", bool(stops) or bool(muffled),
+                    ", ".join(e["outcome"] for e in w.find("turn_end", m)) + (" +muffled-stop" if muffled else "")))
     # still awake: follow-up w/o wake word
     time.sleep(0.8)
     m2 = w.mark()
@@ -287,6 +296,27 @@ def cough_during_answer(w, ctx):
     return ck
 
 
+@scenario("non_word_over_answer_resolves", "A brief non-word sound ('Hmm.') spoken over the answer: the answer is paused "
+          "and then either resumed (heard as noise) or obeyed as a stop (heard as a short word) — never answered "
+          "as if it were a request. Which one depends on what Whisper hears; the resume path itself is covered "
+          "by tests/unit/test_barge_in_confirm.py.", tags=("barge",))
+def non_word_over_answer_resolves(w, ctx):
+    ck = []
+    m, c, ok = _start_long_answer(w, ctx, "Tell me about the planet Mars.")
+    ck.append(Check("answer started", ok is not None))
+    if not ok:
+        return ck
+    w.user.say("Hmm.", delay=1.0, gain=0.8)
+    w.wait_ev("turn_end", m, timeout=60)
+    w.wait_quiet(20)
+    paused = w.find("speaker_pause", m)
+    resolved = w.find("speaker_resume", m) + w.find("speaker_stop", m)
+    ck.append(Check("a pause never stays unresolved", len(resolved) >= len(paused), f"{len(paused)} pauses / {len(resolved)} resolutions"))
+    ck.append(Check("the sound was not answered by the LLM", len(w.find("llm_start", m)) == 1,
+                    f"{len(w.find('llm_start', m))} LLM calls"))
+    return ck
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Environment: noise, echo, quiet voices
 # ═════════════════════════════════════════════════════════════════════════════
@@ -364,8 +394,9 @@ def barge_in_through_echo(w, ctx):
     items = audio_items(w.events)
     aborted = [i for i in items if i["kind"] == "tts" and i["completed"] is False]
     ck.append(Check("interruption heard over own echo", bool(aborted) and len(w.find("barge_in", m)) >= 1))
-    if aborted:
-        ctx.metrics["echo_stop_latency_ms"] = (aborted[-1]["t1"] - say_start_t(w, clip)) * 1000
+    silenced = [e["t"] for e in w.events if e["ev"] in ("speaker_pause", "speaker_stop") and e["t"] >= say_start_t(w, clip)]
+    if silenced:       # audible silence (pause/stop + 60 ms fade), not the end of the item (that waits for STT)
+        ctx.metrics["echo_stop_latency_ms"] = (min(silenced) + 0.06 - say_start_t(w, clip)) * 1000
     return ck
 
 
@@ -541,7 +572,7 @@ def speaker_echo_loud(w, ctx):
 
 @scenario("speaker_echo_without_aec",
           "BASELINE: same room as speaker_echo but with the echo canceller disabled (shows what AEC buys).",
-          world={"echo_gain": 0.35, "cfg_overrides": {"aec_enabled": False}}, tags=("ab",))
+          world={"echo_gain": 0.35, "cfg_overrides": {"aec_enabled": False}}, tags=("ab",), allow_unsettled=True)
 def speaker_echo_without_aec(w, ctx):
     ck = []
     m, c, ok = _start_long_answer(w, ctx, "Tell me about the planet Mars.")

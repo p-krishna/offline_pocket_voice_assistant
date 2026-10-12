@@ -26,8 +26,11 @@ Around that core: a software echo canceller (so it can be interrupted on loudspe
 a slow model thinks, adaptive end-of-speech detection, offline-cached failure phrases, and a structured trace of
 every state transition.
 
-> The default system prompt is currently a **German tutor**; Whisper (`tiny.en`), the Kokoro voice and the cached
-> phrases are still English. See "Language" in the design doc before relying on German speech.
+> The default system prompt is a **German tutor**, but Whisper (`tiny.en`), the Kokoro voice and the cached
+> phrases are English. The pipeline logs a `LANGUAGE STACK` warning at start. For real German use a multilingual
+> Whisper model (`WHISPER_MODEL=…/ggml-small.bin`, `WHISPER_LANGUAGE=de`); Kokoro v1.0 has no German voice, so
+> answers are spoken with an English accent until a German TTS is added. German stop/thanks/goodbye/time words
+> are recognised already. Details: [docs/engineering_log.md](docs/engineering_log.md) §11–§12.
 
 ---
 
@@ -164,13 +167,20 @@ stateDiagram-v2
 - Per-phase LLM timeouts (first token 60 s / stall 30 s / total 120 s). Failures are *spoken* from the offline phrase cache (STT, LLM and TTS specific), dead servers are restarted without duplicating them.
 
 **Interruptions**
-- Talking over the answer ducks the assistant's voice after ~60 ms and stops it after ~190 ms; the interruption becomes the next request. A short "stop" works; an unrecognised brief word spoken over the assistant counts as a stop.
+- Talking over the answer ducks the assistant's voice after ~60 ms and **pauses** it after ~190 ms (fade-out, position held). Speech-to-text then decides: noise (a cough) → the answer resumes where it stopped; "stop" or a muffled short word → it stops and stays silent; real speech → it stops and the speech becomes the next request. A pause nobody resolves continues after 40 s.
+- "yes" / "okay" / "no" over an answer that ended in a question are treated as the user's answer, not as "stop".
 - Speaking while the assistant is still *thinking* is recorded and transcribed first; only real speech cancels the pending answer, and cancelling hangs up on llama-server.
 - Loudspeakers: the assistant subtracts its own output from the mic (echo canceller trained by ~2 s of soft noise at start) and falls back to a learned speaker→mic coupling gate. Headsets need no cancellation.
 
-**Observability**
+**Robustness**
+- If the microphone disappears the assistant says so, keeps retrying by device name, and says when it is back.
+- Servers are never started twice: recovery waits while the port is bound; server output goes to `debug_logs/server_<name>.log`.
+- At start, missing model files (for servers that are not already running) and an inconsistent language stack are reported before anything else.
+
+**Observability and privacy**
 - Every run writes a structured trace (`debug_logs/trace_*.jsonl`) and one line per turn in `debug_logs/turns_<date>.jsonl`. `make analyze-trace` summarises the newest trace.
-- `LOG_LEVEL=DEBUG` for chatty logs; a 5 s microphone level line warns on near-silence; `DEBUG_SAVE_WAV=1` keeps each utterance in `debug_audio/`.
+- By default **no recordings and no transcripts are kept**: the trace and logs hold only lengths and timings. `LOG_TRANSCRIPTS=1` adds what was said; `DEBUG_SAVE_WAV=1` keeps utterance WAVs in `debug_audio/` (newest `DEBUG_MAX_WAVS`=200 only).
+- `LOG_LEVEL=DEBUG` for chatty logs; a 5 s microphone level line warns on near-silence.
 
 ---
 
@@ -244,15 +254,17 @@ All settings live in `src/common/config.py` (one dataclass); every field has an 
 | STT confidence floor | `-0.7` mean log-prob | `STT_MIN_LOGPROB`, `STT_CONFIDENCE` |
 | First spoken filler | `3.5 s` | `PROGRESS_FIRST_PHRASE_S`, `PROGRESS_PULSE_EVERY_S`, `PROGRESS_PHRASE_EVERY_S` |
 | LLM timeouts (first token / stall / total) | `60 / 30 / 120 s` | `LLM_FIRST_TOKEN_TIMEOUT_S`, `LLM_STALL_TIMEOUT_S`, `LLM_TOTAL_TIMEOUT_S` |
-| Echo canceller | on, 14 partitions | `AEC_ENABLED`, `AEC_PARTITIONS`, `AEC_MU`, `AEC_CALIBRATE_ON_START` |
+| Echo canceller | on, 14 partitions | `AEC_ENABLED`, `AEC_PARTITIONS`, `AEC_MU`, `AEC_CALIBRATE_ON_START`, `AEC_TRUSTED_ERLE_DB` (8) |
+| Barge-in pause timeout | `40 s` | `BARGE_IN_PAUSE_TIMEOUT_S` |
 | Conversation memory | `3` turns, `240` chars | `MEMORY_TURNS`, `MEMORY_ASSISTANT_MAX_CHARS` |
 | Conversation timeout / warning | `45 s` / `8 s` | `CONVERSATION_TIMEOUT_S`, `CONVERSATION_WARNING_S` |
 | Max LLM tokens | `150` | `LLM_PREDICT_TOKENS` |
 | System prompt | German tutor | `LLM_SYSTEM_PROMPT` |
-| Server URLs | `127.0.0.1:8080/8081/8082` | `LLM_SERVER_URL`, `STT_SERVER_URL`, `TTS_SERVER_URL` |
+| Server URLs | `127.0.0.1:8080/8081/8082` | `LLM_SERVER_URL`, `STT_SERVER_URL`, `TTS_SERVER_URL` (health checks and recovery follow these; the launch scripts take `LLM_PORT`, `STT_PORT`) |
+| llama-server context / slots | `4096` / `1` | `LLM_CTX`, `LLM_PARALLEL`, `LLM_MODEL_PATH`, `LLAMA_SERVER_BIN` |
 | TTS voice | `af` | `TTS_VOICE`, `SYSTEM_VOICE`, `RESPONSE_VOICE` |
 | Log level / trace path | `INFO` | `LOG_LEVEL`, `LOG_FILE`, `TRACE_PATH` |
-| Debug WAV saving / dir | on / `debug_audio` | `DEBUG_SAVE_WAV`, `DEBUG_DIR` |
+| Keep recordings / transcripts | off / off | `DEBUG_SAVE_WAV`, `DEBUG_MAX_WAVS`, `LOG_TRANSCRIPTS`; dir `DEBUG_DIR` |
 
 ---
 

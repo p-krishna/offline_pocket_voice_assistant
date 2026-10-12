@@ -9,7 +9,7 @@ PIP    ?= pip
 # ── System dependencies ───────────────────────────────────────────────────────
 install-system:
 	sudo apt-get update
-	sudo apt-get install -y libspeexdsp-dev swig portaudio19-dev
+	sudo apt-get install -y libspeexdsp-dev swig portaudio19-dev netcat-openbsd
 
 # ── Python dependencies ───────────────────────────────────────────────────────
 install-python-deps:

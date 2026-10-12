@@ -143,11 +143,15 @@ class ReferenceBuffer:
 
 class EchoCanceller:
     def __init__(self, block: int = 480, partitions: int = 12, mu: float = 1.6, sr: int = 16000,
-                 ref: Optional[ReferenceBuffer] = None, ref_delay_s: float = 0.0):
+                 ref: Optional[ReferenceBuffer] = None, ref_delay_s: float = 0.0, trust_db: float = 8.0):
         self.B = block
         self.K = partitions
         self.mu = mu
         self.sr = sr
+        self.trust_db = trust_db        # cancellation needed before callers may drop their echo safety margin
+        self.giveup_blocks = 0          # far-end blocks seen since delay estimation was abandoned
+        self._trusted = False           # latched like `converged`: the smoothed ERLE dips whenever the room is
+                                        # quiet, and a flag that followed it would flip barge-in caution on and off
         self.ref = ref or ReferenceBuffer(sr)
         self.ref_delay_s = ref_delay_s
         N = 2 * block
@@ -172,6 +176,11 @@ class EchoCanceller:
         self.delay_tries = 0
         self.bypassed = False
 
+    @property
+    def trusted(self) -> bool:
+        """Converged *and* has reached `trust_db` of cancellation (latched until the filter is reset)."""
+        return self.converged and self._trusted
+
     def _estimate_delay(self) -> None:
         """GCC-PHAT between the recent mic and reference signals → bulk echo delay."""
         mic = np.concatenate([m for m, _ in self.delay_hist])
@@ -191,6 +200,7 @@ class EchoCanceller:
             self.delay_locked = True
             self.W[:] = 0
             self.converged = False
+            self._trusted = False
             self.erle_db = 0.0
             self.trained_blocks = 0
             self.X[:] = 0
@@ -226,6 +236,15 @@ class EchoCanceller:
             self.trained_blocks = 0
             self.delay_hist = []
 
+        if not self.delay_locked and self.delay_tries >= 8:
+            # Gave up (headset / no acoustic path). Re-arm after a long stretch of far-end audio so a switch
+            # from headset to loudspeakers later in the session is picked up instead of staying bypassed.
+            self.giveup_blocks += 1
+            if self.giveup_blocks >= 600:           # ≈ 18 s of far-end audio
+                self.giveup_blocks = 0
+                self.delay_tries = 4
+                self.delay_hist = []
+
         if not self.delay_locked and self.delay_tries < 8:
             # Collect ~1 s of far-end-active audio with the reference read WITHOUT any delay.
             if fe > 1e-5:
@@ -258,6 +277,7 @@ class EchoCanceller:
             if self._bad >= 6:
                 self.W[:] = 0
                 self.converged = False
+                self._trusted = False
                 self.erle_db = 0.0
                 self._bad = 0
                 self.resets += 1
@@ -283,6 +303,8 @@ class EchoCanceller:
                 self.erle_db = 0.95 * self.erle_db + 0.05 * float(np.clip(10 * np.log10(Ed / Ee), -10, 40))
                 if self.erle_db > 8.0:
                     self.converged = True
+                if self.erle_db >= self.trust_db:
+                    self._trusted = True
         if mu > 0 and fe > 1e-7:
             E = np.fft.rfft(np.concatenate([np.zeros(B, dtype=np.float32), e])).astype(np.complex64)
             P = np.sum(np.abs(self.X) ** 2, axis=0) + 1e-3 * B

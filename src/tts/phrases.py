@@ -54,6 +54,8 @@ PHRASES = {
     "fallback_llm":     "Sorry, I'm having trouble thinking right now. Please try again in a moment.",
     "fallback_tts":     "Sorry, my voice is having trouble. Please try again.",
     "fallback_generic": "Sorry, something went wrong. Please try again.",
+    "mic_lost":         "I lost my microphone. I'll keep trying to reconnect.",
+    "mic_back":         "My microphone is back.",
     "llm_timeout":      "Sorry, that took too long and I had to give up. Could you ask again, maybe more simply?",
 }
 

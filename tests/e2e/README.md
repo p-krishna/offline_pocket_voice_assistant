@@ -30,3 +30,10 @@ Notes
   because it shares the TTS server; re-run for clean numbers).
 * Timing values are measured from the *end of the user's audio clip* (which includes ~150 ms of TTS trailing pad).
 * The whole suite takes ~20 min; `--tag core` is the quick subset; `--tag soak` runs the 90 s idle-noise test.
+* `@scenario(..., allow_errors=True)` tolerates injected-fault error events; `allow_unsettled=True` turns the "every
+  turn ended" / "returned to idle" end-state checks into warnings for deliberately self-feeding baselines.
+* "Fell silent after stop" is measured from the `speaker_pause` / `speaker_stop` trace event (+ 60 ms fade), not
+  from the end of the audio item: since barge-in became pause-then-confirm the item ends only when STT has decided.
+* Model-dependent scenarios (anything that needs Whisper tiny.en to hear a specific short word) can flake; judge a
+  change with `-r 5` against the previous commit, not with one run.
+

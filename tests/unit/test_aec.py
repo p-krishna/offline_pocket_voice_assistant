@@ -159,3 +159,47 @@ def test_queued_reference_models_underrun_gaps_and_gapless_playback():
     gap = r.read(t0 + 0.25, 1600)              # 0.20 s of audio played, then silence
     assert np.abs(gap).max() == 0
     assert abs(r.read(t0 + 0.42, 800).mean() - 1000 / 32768) < 1e-6
+
+
+# ── review findings F12 / F13 ────────────────────────────────────────────────
+def test_trusted_is_latched_and_cleared_on_reset():
+    from audio.aec import EchoCanceller
+    e = EchoCanceller(trust_db=8.0)
+    assert not e.trusted
+    e.converged, e._trusted = True, True
+    e.erle_db = 2.0                      # a quiet spell: smoothed ERLE dips, trust must not flip
+    assert e.trusted
+    e.converged = False                  # filter reset
+    assert not e.trusted
+
+
+def test_trust_is_reached_through_processing():
+    import numpy as np
+    from audio.aec import EchoCanceller, ReferenceBuffer
+    ref = ReferenceBuffer(16000)
+    e = EchoCanceller(block=480, partitions=4, ref=ref, trust_db=8.0)
+    rng = np.random.default_rng(1)
+    t = 50.0
+    far = (rng.standard_normal(480 * 400) * 3000).astype(np.int16)
+    for k in range(400):
+        seg = far[k * 480:(k + 1) * 480]
+        ref.push(t + k * 0.03, 0, seg, 16000)
+        # the microphone hears the far end 30 ms later, attenuated
+        e.process((seg * 0.4).astype(np.int16), t + (k + 1) * 0.03 + 0.03)
+    assert e.trusted == (e.converged and e.erle_db >= 0 and e._trusted)
+
+
+def test_delay_estimation_is_rearmed_after_giving_up():
+    import numpy as np
+    from audio.aec import EchoCanceller, ReferenceBuffer
+    ref = ReferenceBuffer(16000)
+    e = EchoCanceller(block=480, partitions=4, ref=ref)
+    e.delay_tries = 8                       # gave up earlier (headset)
+    e.delay_locked = False
+    t = 100.0
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal(480) * 3000).astype(np.int16)
+    for k in range(700):                    # 700 blocks with far-end audio present
+        ref.push(t + k * 0.03, 0, x, 16000)
+        e.process(np.zeros(480, dtype=np.int16), t + (k + 1) * 0.03)
+    assert e.delay_tries < 8, "estimation must be retried after a long stretch of far-end audio"

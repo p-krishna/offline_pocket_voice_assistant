@@ -52,7 +52,7 @@ def run_one(sc, proxy, out_root: Path, verbose: bool, suffix: str = "") -> dict:
         w = World(sc.name, out, **world_kw)
         w.start()
         checks = sc.run(w, ctx)
-        checks += generic_checks(w, allow_errors=sc.allow_errors)
+        checks += generic_checks(w, allow_errors=sc.allow_errors, allow_unsettled=sc.allow_unsettled)
     except Exception as e:                                           # scenario crashed
         error = traceback.format_exc()
         checks.append(Check("scenario ran without crashing", False, repr(e)))

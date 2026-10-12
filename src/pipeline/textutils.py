@@ -27,6 +27,10 @@ _JUNK = {
     "oh", "ah", "huh", "okay", "okay.", "ok",
 }
 
+# Compared on the normalised form ("okay." and "okay" are the same word). Plain acknowledgements are
+# legitimate cut-ins ("okay" = enough), so they are never junk.
+_JUNK_NORMALIZED = None   # filled below, after normalize() exists
+
 _WRAPPED = re.compile(r"^\W*(\[[^\]]*\]|\([^)]*\)|\*[^*]*\*|♪[^♪]*♪?)\W*$")
 
 
@@ -34,6 +38,9 @@ def normalize(text: str) -> str:
     """lowercase, drop punctuation, collapse whitespace (for matching only)."""
     t = re.sub(r"[^\w\s']", " ", text.lower())
     return re.sub(r"\s+", " ", t).strip()
+
+
+_JUNK_NORMALIZED = {normalize(j) for j in _JUNK} - {"okay", "ok"}
 
 
 def has_repetition_loop(text: str) -> bool:
@@ -66,7 +73,7 @@ def is_hallucination(text: Optional[str]) -> bool:
     rest = re.sub(r"\[[^\]]*\]|\([^)]*\)|\*[^*]*\*", " ", t).strip()
     if len(re.sub(r"[\W_]+", "", rest)) < 2:
         return True
-    return normalize(rest) in {normalize(j) for j in _JUNK - {"okay", "ok"}}
+    return normalize(rest) in _JUNK_NORMALIZED
 
 
 def clean_transcript(text: str) -> str:
@@ -79,8 +86,15 @@ def _wake_name(wakeword: str) -> str:
     return wakeword.replace("hey_", "").replace("_", " ").strip()
 
 
-def strip_wake_phrase(text: str, wakeword: str = "hey_jarvis") -> str:
-    """Remove a leading 'Hey Jarvis' (and common whisper mis-hearings) from a transcript."""
+def strip_wake_phrase(text: str, wakeword: str = "hey_jarvis", strict: bool = False) -> str:
+    """
+    Remove a leading 'Hey Jarvis' (and common whisper mis-hearings) from a transcript.
+
+    `strict=False` is for captures known to contain the wake phrase: the greeting is optional and the fuzzy
+    list may match bare ("Harvest what is 2 plus 3"). `strict=True` is for everything else: an explicit
+    greeting is required, so a request that merely starts with a real word that sounds like the name
+    ("Service animals in Germany…") is left alone.
+    """
     name = re.escape(_wake_name(wakeword))
     if _wake_name(wakeword) == "jarvis":
         # whisper-tiny hears "Jarvis" as Darvis / Travis / Jarvus / Harvest / Jar this / service …
@@ -88,6 +102,9 @@ def strip_wake_phrase(text: str, wakeword: str = "hey_jarvis") -> str:
                  r"jar\s*this|jar\s*vis|jar\s*bus|jar\s*vice|j\w?rv\w{1,3})")
     else:
         fuzzy = name
+    if strict:
+        pat = re.compile(rf"^\W*(?:hey|hi|hay|okay|ok|hello)[\s,.!-]+{fuzzy}\b[\s,.!?:;-]*", re.I)
+        return pat.sub("", text.strip(), count=1).strip()
     greet = r"(?:hey|hi|hay|okay|ok|hello|a|eh|it|is|that's|hate|he)"
     pat = re.compile(rf"^\W*(?:{greet}[\s,.!-]+)?{fuzzy}\b[\s,.!?:;-]*", re.I)
     out = pat.sub("", text.strip(), count=1)
@@ -98,17 +115,26 @@ def strip_wake_phrase(text: str, wakeword: str = "hey_jarvis") -> str:
 
 # ── Intents (strict: only near-whole-utterance matches) ──────────────────────
 
-_PRE = r"(?:(?:ok(?:ay)?|alright|please|hey|um|uh|well)\s+)*"
-_POST = r"(?:\s+(?:please|now|thanks|thank you))?"
+_PRE = r"(?:(?:ok(?:ay)?|alright|please|hey|um|uh|well|also|ach|na|bitte)\s+)*"
+_POST = r"(?:\s+(?:please|now|thanks|thank you|bitte|jetzt|danke))?"
+# Time/date questions must be (nearly) the whole utterance: "what time is it in Tokyo" is not the local time.
+_TAIL = r"(?:\s+(?:please|right now|now|currently|today|at the moment|bitte|gerade|jetzt))*"
 
 _INTENTS = [
-    ("stop", re.compile(rf"^{_PRE}(?:stop(?: it| that| talking| speaking)?|cancel(?: that)?|never ?mind|be quiet|quiet|shut up|enough|that'?s enough|hold on){_POST}$")),
-    ("sleep", re.compile(rf"^{_PRE}(?:good ?bye|bye(?: bye)?|go to sleep|that'?s all(?: for now)?|that is all|see you(?: later)?|i'?m done|we'?re done|talk to you later|thanks?,? (?:bye|that'?s all)){_POST}$")),
-    ("repeat", re.compile(rf"^{_PRE}(?:(?:can|could|would) you )?(?:please )?(?:repeat(?: that)?|say that again|say it again|what did you say|come again|pardon(?: me)?|sorry what){_POST}$")),
-    ("time", re.compile(r"\b(?:what(?:'s| is) the (?:current )?time|what time is it|tell me the time|do you (?:know|have) the time|current time)\b")),
-    ("date", re.compile(r"\b(?:what(?:'s| is) (?:the )?(?:today'?s )?date|what day is (?:it|today)|today'?s date|what is today)\b")),
-    ("greeting", re.compile(rf"^{_PRE}(?:hello|hi|hey|hi there|hey there|hello there|good (?:morning|afternoon|evening))(?: there)?$")),
-    ("thanks", re.compile(rf"^{_PRE}(?:thank you|thanks|thank you (?:very|so) much|thanks a (?:lot|bunch)|cheers|great thanks|perfect thanks)$")),
+    ("stop", re.compile(rf"^{_PRE}(?:stop(?: it| that| talking| speaking)?|cancel(?: that)?|never ?mind|be quiet|quiet|shut up|enough|that'?s enough|hold on"
+                        rf"|stopp?(?: das| jetzt)?|hör auf|halt|genug|das reicht|sei still|ruhe){_POST}$")),
+    ("sleep", re.compile(rf"^{_PRE}(?:good ?bye|bye(?: bye)?|go to sleep|that'?s all(?: for now)?|that is all|see you(?: later)?|i'?m done|we'?re done|talk to you later|thanks?,? (?:bye|that'?s all)"
+                         rf"|tschüss|tschüs|auf wiedersehen|bis später|bis bald|das war'?s|ciao){_POST}$")),
+    ("repeat", re.compile(rf"^{_PRE}(?:(?:can|could|would) you )?(?:please )?(?:repeat(?: that)?|say that again|say it again|what did you say|come again|pardon(?: me)?|sorry what"
+                          rf"|wiederhole(?: das)?|noch(?: ein)?mal|wie bitte|kannst du das wiederholen){_POST}$")),
+    ("time", re.compile(rf"^{_PRE}(?:what(?:'s| is) the (?:current )?time|what time is it|tell me the time|do you (?:know|have) the time|current time"
+                        rf"|wie spät ist es|wie viel uhr ist es|wieviel uhr ist es){_TAIL}$")),
+    ("date", re.compile(rf"^{_PRE}(?:what(?:'s| is) (?:the )?(?:today'?s )?date|what day is (?:it|today)|today'?s date|what is today"
+                        rf"|welcher tag ist (?:heute|es)|welches datum haben wir|der wievielte ist (?:heute|es)){_TAIL}$")),
+    ("greeting", re.compile(rf"^{_PRE}(?:hello|hi|hey|hi there|hey there|hello there|good (?:morning|afternoon|evening)"
+                            rf"|hallo|guten (?:morgen|tag|abend)|servus|moin)(?: there)?$")),
+    ("thanks", re.compile(rf"^{_PRE}(?:thank you|thanks|thank you (?:very|so) much|thanks a (?:lot|bunch)|cheers|great thanks|perfect thanks"
+                          rf"|danke|danke schön|vielen dank|dankeschön)$")),
 ]
 
 
@@ -116,19 +142,29 @@ _INTENTS = [
 # the assistant was talking/thinking (source barge / interject), never as a standalone request.
 _CUT_IN = re.compile(rf"^{_PRE}(?:no(?: no)*|nope|wait|wait wait|okay|ok|alright|all right|got it|i got it|i see|"
                      rf"fine|yes|yeah|yep|enough|thanks|thank you|that'?s (?:fine|ok|okay|good|enough)|"
-                     rf"i understand|understood|right|sure|hmm|uh huh|mm hmm){_POST}$")
+                     rf"i understand|understood|right|sure|hmm|uh huh|mm hmm"
+                     rf"|nein|nee|moment|genug|ja|okay|alles klar|verstanden|gut|schon gut){_POST}$")
 
 
-def classify_intent(text: str, barge: bool = False) -> Optional[str]:
+def classify_intent(text: str, barge: bool = False, awaiting_answer: bool = False) -> Optional[str]:
+    """
+    `barge`: the speech came while the assistant was talking/thinking.
+    `awaiting_answer`: the assistant's last reply ended in a question, so "yes" / "okay" / "no" over it
+    are the user's *answer*, not "enough" — they go to the LLM instead of stopping it.
+    """
     t = normalize(text)
     if not t or len(t.split()) > 8:
         return None
     for name, pat in _INTENTS:
         if pat.search(t):
             return name
-    if barge and _CUT_IN.search(t):
+    if barge and not awaiting_answer and _CUT_IN.search(t):
         return "stop"
     return None
+
+
+def ends_with_question(text: str) -> bool:
+    return text.rstrip().rstrip("\"')”").endswith("?")
 
 
 def answer_intent(intent: str, now: Optional[datetime] = None) -> Optional[str]:
@@ -262,3 +298,42 @@ def trim_for_memory(text: str, limit: int) -> str:
         return text
     cut = max(text.rfind(c, 0, limit) for c in ".!?")
     return text[: cut + 1] if cut > 0 else text[:limit]
+
+
+# ── Endpointing: how patient to be after the speaker went quiet ──────────────
+
+# A sentence cannot end on these: the speaker is mid-thought even if STT added a full stop.
+DANGLING = {"and", "or", "but", "because", "the", "a", "an", "to", "of", "with", "for", "my", "your",
+            "if", "then", "like", "um", "uh", "from", "by", "und", "oder", "aber", "weil", "der", "die", "das",
+            "ein", "eine", "zu", "mit", "für", "wenn", "dann", "äh", "ähm"}
+DANGLING_UNLESS_QUESTION = {"about", "is", "are", "was", "that", "it", "this", "there"}
+
+
+def endpoint_class(raw: Optional[str], wakeword: str, wakeish: bool) -> str:
+    """
+    What the transcript so far says about how long to keep waiting in silence.
+      "pending"     no transcript available (caller decides)
+      "wake_wait"   bare wake phrase / unreadable fragment right after it → wait long for the request
+      "question"    ends like a finished question or sentence → answer sooner
+      "hesitation"  trails off ("…and the") → the speaker is probably still thinking
+      "default"     nothing special
+    The wake phrase is only looked for when the capture actually contained it (`wakeish`).
+    """
+    if raw is None or is_hallucination(raw):
+        return "wake_wait" if wakeish else "default"
+    text = clean_transcript(raw)
+    core = strip_wake_phrase(text, wakeword, strict=not wakeish)
+    if not core:
+        return "wake_wait"
+    words = core.lower().split()
+    last = words[-1].strip(".,?!;:") if words else ""
+    stripped = text.rstrip()
+    if stripped.endswith("?") and len(words) >= 1:
+        return "question"
+    if stripped.endswith((",", "-", "…", "...")) or last in DANGLING:
+        return "hesitation"
+    if last in DANGLING_UNLESS_QUESTION and not stripped.endswith((".", "!")):
+        return "hesitation"
+    if stripped.endswith((".", "?", "!")) and len(words) >= 2:
+        return "question"
+    return "default"

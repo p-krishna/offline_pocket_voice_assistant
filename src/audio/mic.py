@@ -14,6 +14,8 @@ log = get_logger("mic")
 
 class MicBase:
     sample_rate = 16000
+    # Optional hook: called with "lost" / "restored" from the thread that calls read().
+    on_status = None
 
     def open(self) -> None: ...
     def read(self, n_samples: int) -> bytes: raise NotImplementedError
@@ -30,6 +32,9 @@ class PyAudioMic(MicBase):
         self._stream = None
         self._frames = 0
         self._errors = 0
+        self._consecutive = 0
+        self._lost = False
+        self._next_reopen = 0.0
         self._t_log = 0.0
         self._peak = 0
         self._sumsq = 0.0
@@ -55,17 +60,49 @@ class PyAudioMic(MicBase):
     def read(self, n_samples: int) -> bytes:
         try:
             data = self._stream.read(n_samples, exception_on_overflow=False)
-        except OSError as e:
-            # Device hiccup (e.g. USB mic re-enumerated). Return silence and let
-            # the loop continue instead of killing the whole assistant.
+        except (OSError, AttributeError) as e:
+            # Device hiccup (e.g. USB mic unplugged / re-enumerated). Return silence so the loop keeps
+            # running, and keep trying to get the device back (by name, so a new index is fine).
             self._errors += 1
+            self._consecutive += 1
             if self._errors <= 3 or self._errors % 100 == 0:
                 log.error("mic read failed (#%d) on %s: %s", self._errors,
                           self.device.name if self.device else "?", e)
+            if self._consecutive >= 5 and not self._lost:
+                self._lost = True
+                self._notify("lost")
+            if self._consecutive >= 5 and time.monotonic() >= self._next_reopen:
+                self._next_reopen = time.monotonic() + 2.0
+                self._try_reopen()
             time.sleep(n_samples / self.sample_rate)
             return b"\x00\x00" * n_samples
+        self._consecutive = 0
+        if self._lost:
+            self._lost = False
+            self._notify("restored")
         self._level_log(data)
         return data
+
+    def _notify(self, event: str) -> None:
+        log.warning("microphone %s", event)
+        cb = self.on_status
+        if cb is not None:
+            try:
+                cb(event)
+            except Exception:
+                log.exception("mic status callback")
+
+    def _try_reopen(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+        try:
+            self.open()
+            log.info("microphone reopened")
+        except Exception as e:
+            self._stream = None
+            log.debug("microphone reopen failed: %s", e)
 
     def _level_log(self, data: bytes) -> None:
         """Every 5 s at DEBUG: input level, so a dead/wrong mic is obvious (peak stays ~0)."""

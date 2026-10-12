@@ -124,9 +124,14 @@ def pcm_from_wav_bytes(wav: bytes):
 
 
 class Speaker:
-    def __init__(self, backend: SpeakerBackend, drain_extra_s: float = 0.15):
+    def __init__(self, backend: SpeakerBackend, drain_extra_s: float = 0.15, pause_timeout_s: float = 40.0):
         self.backend = backend
         self.drain_extra_s = drain_extra_s
+        # A pause that nobody resolves (a crashed confirmation thread, a dead STT server) must not leave the
+        # assistant mute for good: after this long the answer simply continues.
+        self.pause_timeout_s = pause_timeout_s
+        self._paused = False
+        self._paused_at = 0.0
         self._q: "queue.Queue[AudioItem]" = queue.Queue()
         self._lock = threading.Lock()
         self.epoch = 0
@@ -160,9 +165,34 @@ class Speaker:
         self._q.put(item)
         return item
 
+    def pause(self, reason: str = "") -> None:
+        """
+        Fade out and hold the current answer exactly where it is (nothing is discarded). Used when the
+        user starts talking over us: we cannot yet know if it was a request, "stop", or a cough. The
+        caller must follow up with resume() or stop().
+        """
+        with self._lock:
+            if self._paused:
+                return
+            self._paused = True
+            self._paused_at = time.monotonic()
+        trace.emit("speaker_pause", reason=reason)
+
+    def resume(self, reason: str = "") -> None:
+        with self._lock:
+            was = self._paused
+            self._paused = False
+        if was:
+            trace.emit("speaker_resume", reason=reason, held_s=round(time.monotonic() - self._paused_at, 2))
+
+    def is_paused(self) -> bool:
+        return self._paused
+
     def stop(self, reason: str = "") -> int:
         """Silence now: abort current item, discard queued ones, bump epoch."""
         with self._lock:
+            self._paused = False
+            self._duck = 1.0
             self.epoch += 1
             new_epoch = self.epoch
             cur = self._current
@@ -233,7 +263,9 @@ class Speaker:
 
     def _play(self, item: AudioItem) -> None:
         self._abort.clear()
-        self._gain = self._duck = 1.0
+        # Carry ducking/pausing across items: resetting to 1.0 here made every new sentence start at full
+        # volume for a frame or two while the user was still talking over us.
+        self._gain = 0.0 if self._paused else self._duck
         # An abort raised between the epoch check and here must still win.
         if item.epoch is not None and item.epoch < self.epoch:
             self._finish_dropped(item)
@@ -267,9 +299,15 @@ class Speaker:
                     if fade_left == 0:
                         aborted = True
                         break
+                if self._paused and time.monotonic() - self._paused_at > self.pause_timeout_s:
+                    log.warning("pause not resolved after %.0fs → resuming", self.pause_timeout_s)
+                    self.resume("timeout")
+                if self._paused and self._gain <= 0.001 and fade_left is None:
+                    time.sleep(0.01)                  # faded out: hold position, write nothing
+                    continue
                 end = min(offset + chunk, len(pcm))
                 seg = pcm[offset:end]
-                target = self._duck
+                target = 0.0 if self._paused else self._duck
                 gains = (1.0, 1.0)
                 if fade_left is not None:
                     g0, g1 = self._gain * fade_left / 3.0, self._gain * (fade_left - 1) / 3.0

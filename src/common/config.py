@@ -98,7 +98,12 @@ class Config:
 
     # --- Debug ---
     debug_mode:                        bool  = os.getenv("DEBUG_MODE", "1") == "1"
-    debug_save_wav:                    bool  = os.getenv("DEBUG_SAVE_WAV", "1") == "1"
+    # Privacy: a voice assistant for people at home should not keep recordings or transcripts by default.
+    # Opt in (DEBUG_SAVE_WAV=1 / LOG_TRANSCRIPTS=1) when debugging; saved WAVs are pruned to DEBUG_MAX_WAVS.
+    debug_save_wav:                    bool  = os.getenv("DEBUG_SAVE_WAV", "0") == "1"
+    debug_max_wavs:                    int   = int(os.getenv("DEBUG_MAX_WAVS", "200"))
+    # Without this the trace / turn log / console keep only lengths and timings, not what was said.
+    log_transcripts:                   bool  = os.getenv("LOG_TRANSCRIPTS", "0") == "1"
     debug_dir:                         str   = os.getenv("DEBUG_DIR", "debug_audio")
     turnlogdir:                        str   = os.getenv("TURN_LOG_DIR", "debug_logs")
     log_level:                         str   = os.getenv("LOG_LEVEL", "INFO")
@@ -163,6 +168,11 @@ class Config:
     # Play ~2 s of soft noise at startup so the canceller is trained before the first reply.
     aec_calibrate_on_start: bool = os.environ.get("AEC_CALIBRATE_ON_START", "1") == "1"
     aec_mu: float = float(os.environ.get("AEC_MU", "1.6"))
+    # Cancellation needed before the barge-in safety margin is dropped. Equal to the convergence threshold
+    # (8 dB) on purpose: a stricter value (12 dB) was tried on 2026-10-13 and made real interruptions through
+    # echo undetectable, because the measured ERLE is bounded by the room noise floor (it cannot be read as
+    # filter quality); the residual-based echo floor in the barge-in detector is the real safeguard.
+    aec_trusted_erle_db: float = float(os.environ.get("AEC_TRUSTED_ERLE_DB", "8"))
 
     # --- Interrupt tuning ---
     interrupt_min_speech_ms: int = int(os.environ.get("INTERRUPT_MIN_SPEECH_MS", "190"))
@@ -171,6 +181,9 @@ class Config:
     # (1.0 disables). Gives instant feedback before the stop is confirmed.
     barge_in_duck_gain: float = float(os.environ.get("BARGE_IN_DUCK_GAIN", "0.25"))
     barge_in_duck_after_ms: int = int(os.environ.get("BARGE_IN_DUCK_AFTER_MS", "60"))
+    # While we decide whether speech over our answer was a request, a cough or "stop", the answer is paused
+    # (not stopped). If nobody resolves the pause within this time it simply continues.
+    barge_in_pause_timeout_s: float = float(os.environ.get("BARGE_IN_PAUSE_TIMEOUT_S", "40"))
     interrupt_hiss_filter: bool = os.environ.get("INTERRUPT_HISS_FILTER", "1") == "1"
     # Barge-in energy must exceed (estimated speaker->mic echo) * this factor.
     interrupt_echo_margin: float = float(os.environ.get("INTERRUPT_ECHO_MARGIN", "2.0"))
